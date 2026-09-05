@@ -1,3 +1,12 @@
+viewwall (0.1.1-1) unstable; urgency=medium
+
+  * Recover a feed whose branch wedges after repeated restarts, instead of
+    leaving its viewport dark until viewwall is restarted by hand.
+  * Report a stall watchdog whose timeout matches the startup default, which
+    previously logged nothing and looked like a feed the scaling had missed.
+
+ -- Sebastian Noack <sebastian.noack@gmail.com>  Sat, 05 Sep 2026 19:15:28 -0400
+
 viewwall (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
