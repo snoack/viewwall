@@ -1,4 +1,5 @@
 import socket
+import time
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -1011,3 +1012,191 @@ def test_every_attribute_the_callbacks_use_is_initialised() -> None:
                 assigned.add(target.attr)
     for required in ("_wall_dark", "_metrics_sampled_at", "_stopping", "_fatal_error"):
         assert required in assigned, f"{required} is used but never initialised"
+
+
+def _lifetime_feed() -> object:
+    return SimpleNamespace(
+        config=SimpleNamespace(name="cam"),
+        healthy_at=None,
+        short_lived_generations=0,
+        branches_rebuilt=False,
+        rebuilt_at_generation=None,
+        generation=1,
+    )
+
+
+def test_a_feed_that_never_connected_is_not_reported_as_short_lived(caplog) -> None:
+    # No stream at all is the ordinary case the restart line already covers.
+    runtime = object.__new__(WallRuntime)
+    feed = _lifetime_feed()
+    with caplog.at_level("ERROR"):
+        for _ in range(5):
+            runtime._note_generation_lifetime(feed)
+    assert "died within" not in caplog.text
+
+
+def _wedging_runtime(rebuilt: list[str] | None = None) -> WallRuntime:
+    """A runtime whose branch rebuild records the call instead of doing it."""
+    runtime = object.__new__(WallRuntime)
+    runtime.viewports = {}
+    if rebuilt is not None:
+        runtime._rebuild_feed_branches = lambda feed: (  # type: ignore[method-assign]
+            rebuilt.append(feed.config.name) or True
+        )
+    return runtime
+
+
+def _wedge(runtime: WallRuntime, feed: object, times: int | None = None) -> None:
+    for _ in range(times or WallRuntime.SHORT_GENERATION_LIMIT):
+        feed.healthy_at = time.monotonic()
+        runtime._note_generation_lifetime(feed)
+
+
+def test_a_feed_dying_straight_after_connecting_is_reported(caplog) -> None:
+    # The wedge seen in production: healthy on its first buffer, dead 5s
+    # later, dozens of generations deep, and the log said "video is healthy"
+    # every time.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    feed = _lifetime_feed()
+    with caplog.at_level("ERROR"):
+        _wedge(runtime, feed)
+    assert "connected and died within" in caplog.text
+    assert "cam" in caplog.text
+    # Detecting the wedge is what triggers the one repair a restart cannot do.
+    assert rebuilt == ["cam"]
+
+
+def test_the_branch_is_rebuilt_only_once(caplog) -> None:
+    # A second rebuild would tear down the same branches for a fault that has
+    # already been shown not to live there.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    feed = _lifetime_feed()
+    _wedge(runtime, feed)
+    caplog.clear()
+    with caplog.at_level("ERROR"):
+        _wedge(runtime, feed)
+    assert rebuilt == ["cam"]
+    assert "still wedging after a branch rebuild" in caplog.text
+    assert "only restarting viewwall" in caplog.text
+
+
+def test_a_rebuild_that_worked_says_so(caplog) -> None:
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    feed = _lifetime_feed()
+    _wedge(runtime, feed)
+    # The next generation runs well past the threshold.
+    feed.healthy_at = time.monotonic() - WallRuntime.SHORT_GENERATION_SECONDS - 30
+    with caplog.at_level("WARNING"):
+        runtime._note_generation_lifetime(feed)
+    assert "the rebuild cleared the wedge" in caplog.text
+    assert not feed.branches_rebuilt
+
+
+def test_one_short_generation_is_not_enough(caplog) -> None:
+    runtime = object.__new__(WallRuntime)
+    feed = _lifetime_feed()
+    feed.healthy_at = time.monotonic()
+    with caplog.at_level("ERROR"):
+        runtime._note_generation_lifetime(feed)
+    assert "died within" not in caplog.text
+
+
+def test_a_feed_that_ran_a_while_resets_the_run(caplog) -> None:
+    # A long generation means the feed worked; what came before is history.
+    runtime = object.__new__(WallRuntime)
+    feed = _lifetime_feed()
+    feed.healthy_at = time.monotonic()
+    runtime._note_generation_lifetime(feed)
+    feed.healthy_at = time.monotonic() - WallRuntime.SHORT_GENERATION_SECONDS - 1
+    runtime._note_generation_lifetime(feed)
+    assert feed.short_lived_generations == 0
+    feed.healthy_at = time.monotonic()
+    with caplog.at_level("ERROR"):
+        runtime._note_generation_lifetime(feed)
+    assert "died within" not in caplog.text
+
+
+def _branch_viewport(index: int, feeds: tuple[str, ...], active: str | None):
+    return SimpleNamespace(
+        config=SimpleNamespace(index=index, feeds=feeds, name=f"viewport{index}"),
+        active_feed=active,
+    )
+
+
+def test_a_rotating_viewport_is_rebuilt_too() -> None:
+    # cam_a is on screen while cam_b is wedged. Skipping the repair would
+    # leave cam_b wedged forever and the viewport silently showing one camera
+    # where two were configured, which is harder to spot than a black tile.
+    # The pad released is the inactive one, verified against real GStreamer
+    # to leave the active branch streaming.
+    runtime = object.__new__(WallRuntime)
+    runtime.viewports = {
+        "v9": _branch_viewport(9, ("cam_a", "cam_b"), "cam_a")
+    }
+    done: list[tuple[int, str]] = []
+    runtime._rebuild_one_branch = lambda vp, name: done.append(  # type: ignore[method-assign]
+        (vp.config.index, name)
+    )
+    feed = SimpleNamespace(config=SimpleNamespace(name="cam_b"))
+    assert runtime._rebuild_feed_branches(feed) is True
+    assert done == [(9, "cam_b")]
+
+
+def test_only_viewports_carrying_the_feed_are_rebuilt() -> None:
+    runtime = object.__new__(WallRuntime)
+    runtime.viewports = {
+        "v6": _branch_viewport(6, ("cam",), None),
+        "v9": _branch_viewport(9, ("cam_a", "cam_b"), "cam_a"),
+    }
+    done: list[tuple[int, str]] = []
+    runtime._rebuild_one_branch = lambda vp, name: done.append(  # type: ignore[method-assign]
+        (vp.config.index, name)
+    )
+    feed = SimpleNamespace(config=SimpleNamespace(name="cam"))
+    assert runtime._rebuild_feed_branches(feed) is True
+    assert done == [(6, "cam")]
+
+
+def test_a_dark_viewport_is_rebuilt() -> None:
+    # Nothing is on screen, so the blast radius is zero.
+    runtime = object.__new__(WallRuntime)
+    runtime.viewports = {"v6": _branch_viewport(6, ("cam",), None)}
+    done: list[tuple[int, str]] = []
+    runtime._rebuild_one_branch = lambda vp, name: done.append(  # type: ignore[method-assign]
+        (vp.config.index, name)
+    )
+    feed = SimpleNamespace(config=SimpleNamespace(name="cam"))
+    assert runtime._rebuild_feed_branches(feed) is True
+    assert done == [(6, "cam")]
+
+
+def test_a_failed_rebuild_is_fatal() -> None:
+    # The graph is left without a branch and nothing else can restore it.
+    runtime = object.__new__(WallRuntime)
+    runtime.viewports = {"v6": _branch_viewport(6, ("cam",), None)}
+    fatal: list[str] = []
+    runtime._fatal = fatal.append  # type: ignore[method-assign]
+
+    def boom(_vp, _name):
+        raise RuntimeDependencyError("could not remove queue")
+
+    runtime._rebuild_one_branch = boom  # type: ignore[method-assign]
+    feed = SimpleNamespace(config=SimpleNamespace(name="cam"))
+    assert runtime._rebuild_feed_branches(feed) is False
+    assert fatal and "branch rebuild failed" in fatal[0]
+
+
+def test_the_branch_rebuild_runs_after_the_feed_bin_is_torn_down() -> None:
+    # Ordering matters and nothing downstream can detect it: rebuilding a
+    # branch releases the tee pad feeding it, and a source still running into
+    # a tee with no branches left dies instantly with "not-linked". Verified
+    # against real GStreamer, where the wrong order fails every time.
+    import inspect
+
+    body = inspect.getsource(WallRuntime._restart_feed)
+    assert body.index("_teardown_feed_attempt") < body.index(
+        "_note_generation_lifetime"
+    )

@@ -76,6 +76,10 @@ class FeedRuntime:
     last_frame_at: float | None = None
     max_frame_gap: float | None = None
     decoded_frames: int = 0
+    healthy_at: float | None = None
+    short_lived_generations: int = 0
+    branches_rebuilt: bool = False
+    rebuilt_at_generation: int | None = None
     observed_fps_applied: bool = False
     caps_fps_known: bool = False
     watchdog_reported: bool = False
@@ -101,6 +105,9 @@ class ViewportRuntime:
     sink_generation: int = 0
     selector_pads: dict[str, Any] = field(default_factory=dict)
     branch_crops: dict[str, Any] = field(default_factory=dict)
+    branch_queues: dict[str, Any] = field(default_factory=dict)
+    branch_tee_pads: dict[str, Any] = field(default_factory=dict)
+    branch_generation: int = 0
     active_index: int = 0
     active_feed: str | None = None
     resolved: ResolvedViewport | None = None
@@ -122,6 +129,13 @@ class WallRuntime:
 
     # Below this a window is too short for the frame count to imply a rate.
     MIN_METRICS_WINDOW_S = 1.0
+
+    # A generation that reached healthy and died inside this many seconds
+    # delivered almost nothing: the feed connected but no video followed.
+    SHORT_GENERATION_SECONDS = 15.0
+    # Consecutive such generations before saying so. One is a coincidence --
+    # a camera can drop just after connecting -- and a run of them is not.
+    SHORT_GENERATION_LIMIT = 3
 
     STALL_FRAMES = 45
     MIN_STALL_TIMEOUT_MS = 5_000
@@ -474,6 +488,7 @@ class WallRuntime:
         feed.source_size = None
         feed.last_frame_at = None
         feed.max_frame_gap = None
+        feed.healthy_at = None
         feed.observed_fps_applied = False
         feed.caps_fps_known = False
         feed.watchdog_reported = False
@@ -563,8 +578,181 @@ class WallRuntime:
             self._fatal(str(exc))
             return False
         self._select_alternate_for_failed_feed(feed_name)
+        # After the teardown, never before: rebuilding a branch releases the
+        # tee pad it is fed from, and a source still running into a tee with
+        # no branches left errors out with "not-linked" on the spot.
+        self._note_generation_lifetime(feed)
         self._schedule_feed_retry(feed)
         return False
+
+    def _note_generation_lifetime(self, feed: FeedRuntime) -> None:
+        """Say so when a feed keeps dying immediately after connecting.
+
+        A feed is called healthy on its first buffer, so one frame followed by
+        silence reads in the log exactly like a feed that ran well and then
+        broke -- the same "video is healthy" line, once per generation. Told
+        apart only by noticing that the healthy lines repeat every few seconds,
+        which is not something the log says anywhere.
+
+        The two have different causes and different fixes. A feed that runs and
+        later fails is the camera or the network, and retrying is the answer. A
+        feed that dies this fast every time got its stream and could not keep
+        it, which on this wall has meant the pipeline downstream of the feed
+        bin -- preserved across restarts, and never flushed -- holding state
+        from the generation before. Retrying cannot clear that, so the wall
+        will sit in this loop indefinitely while the rest of it runs normally.
+        """
+        healthy_at = feed.healthy_at
+        if healthy_at is None:
+            # Never reached healthy: no stream at all, which the ordinary
+            # restart line already describes.
+            feed.short_lived_generations = 0
+            return
+        lifetime = time.monotonic() - healthy_at
+        if lifetime > self.SHORT_GENERATION_SECONDS:
+            if feed.branches_rebuilt:
+                LOG.warning(
+                    "feed %s: ran %.0fs after its branch was rebuilt, so the "
+                    "rebuild cleared the wedge",
+                    feed.config.name,
+                    lifetime,
+                )
+                feed.branches_rebuilt = False
+                feed.rebuilt_at_generation = None
+            feed.short_lived_generations = 0
+            return
+        feed.short_lived_generations += 1
+        if feed.short_lived_generations < self.SHORT_GENERATION_LIMIT:
+            return
+        LOG.error(
+            "feed %s: connected and died within %.1fs on %d consecutive "
+            "attempts; the stream reaches the wall but no video follows it. "
+            "Retrying alone does not clear this",
+            feed.config.name,
+            lifetime,
+            feed.short_lived_generations,
+        )
+        # Reported once per run of failures rather than on every attempt: the
+        # condition persists, and repeating it every 30s buries the log the
+        # way the warning it replaces already did.
+        feed.short_lived_generations = 0
+        if feed.branches_rebuilt:
+            # Already tried, and the feed is wedging again. Say so plainly
+            # rather than tearing the same branches down a second time.
+            LOG.error(
+                "feed %s: still wedging after a branch rebuild, so the stale "
+                "state is not in the branch. Check the feed from this machine "
+                "(gst-launch-1.0 rtspsrc location=... ! fakesink); if that "
+                "plays, only restarting viewwall will clear it",
+                feed.config.name,
+            )
+            return
+        feed.branches_rebuilt = self._rebuild_feed_branches(feed)
+        if feed.branches_rebuilt:
+            feed.rebuilt_at_generation = feed.generation
+
+    def _rebuild_feed_branches(self, feed: FeedRuntime) -> bool:
+        """Recreate one feed's branch elements, leaving every other feed alone.
+
+        The branch queue and videocrop are all that a feed restart does not
+        already replace: the bin in front of them is rebuilt every generation
+        and _show_viewport_offline() replaces the sink behind them on every
+        outage. A wedge that survives both is therefore holding state here,
+        and this is the last thing short of restarting the process.
+
+        Every viewport carrying the feed is rebuilt, including one still
+        showing a healthy feed beside the sick one. The pad released there is
+        the inactive one -- the selector switched away when the feed failed --
+        and a rotating viewport that skipped the repair would keep the wedged
+        feed forever, silently showing one camera where two were configured,
+        which is harder to notice than a black tile. Three failed restarts
+        have already happened by this point, so the cost is paid rarely, and
+        a healthy neighbour disturbed by it recovers through the same restart
+        that works for every other transient fault.
+        """
+        rebuilt: list[str] = []
+        for viewport in self.viewports.values():
+            if feed.config.name not in viewport.config.feeds:
+                continue
+            try:
+                self._rebuild_one_branch(viewport, feed.config.name)
+            except RuntimeDependencyError as exc:
+                # The graph is now missing a branch, and nothing else can put
+                # it back, so this is fatal in the way a failed sink swap is.
+                self._fatal(
+                    f"feed {feed.config.name}: branch rebuild failed: {exc}"
+                )
+                return False
+            rebuilt.append(f"viewport {viewport.config.index}")
+        if not rebuilt:
+            LOG.warning(
+                "feed %s: no viewport could be rebuilt; every one showing this "
+                "feed still has another feed on screen",
+                feed.config.name,
+            )
+            return False
+        LOG.warning(
+            "feed %s: rebuilt the branch for %s; the next generation will show "
+            "whether that cleared it",
+            feed.config.name,
+            ", ".join(rebuilt),
+        )
+        return True
+
+    def _rebuild_one_branch(self, viewport: ViewportRuntime, feed_name: str) -> None:
+        feed = self.feeds[feed_name]
+        old_queue = viewport.branch_queues.get(feed_name)
+        old_crop = viewport.branch_crops.get(feed_name)
+        old_pad = viewport.selector_pads.get(feed_name)
+        if old_queue is None or old_crop is None or old_pad is None:
+            raise RuntimeDependencyError("branch elements are missing")
+
+        # Block the tee's pad before touching anything. Releasing a request pad
+        # the tee is actively pushing to leaves the tee flushing every buffer
+        # it handles afterwards, and it never comes back: the branch relinks,
+        # the pads report linked and active, and no video ever arrives. That
+        # failure is indistinguishable from the wedge this repairs, so getting
+        # it wrong here would look like the repair simply not working.
+        old_tee_pad = viewport.branch_tee_pads.get(feed_name)
+        probe = None
+        if old_tee_pad is not None:
+            probe = old_tee_pad.add_probe(
+                self.Gst.PadProbeType.BLOCK_DOWNSTREAM | self.Gst.PadProbeType.IDLE,
+                lambda pad, info: self.Gst.PadProbeReturn.OK,
+            )
+
+        for element in (old_queue, old_crop):
+            element.set_locked_state(True)
+            if element.set_state(self.Gst.State.NULL) == self.Gst.StateChangeReturn.FAILURE:
+                raise RuntimeDependencyError(f"could not stop {element.get_name()}")
+
+        if old_tee_pad is not None:
+            old_tee_pad.unlink(old_queue.get_static_pad("sink"))
+            if probe is not None:
+                old_tee_pad.remove_probe(probe)
+            feed.tee.release_request_pad(old_tee_pad)
+        old_crop.get_static_pad("src").unlink(old_pad)
+        viewport.selector.release_request_pad(old_pad)
+        old_queue.unlink(old_crop)
+        for element in (old_queue, old_crop):
+            if not self.pipeline.remove(element):
+                raise RuntimeDependencyError(f"could not remove {element.get_name()}")
+
+        viewport.branch_generation += 1
+        self._connect_one_branch(viewport, feed_name)
+        # The crop values are per branch and the new videocrop has none.
+        viewport.crop_values = None
+        self._apply_viewport_crop(viewport)
+        # Built into a pipeline that is already PLAYING, unlike the initial
+        # branches, so the new elements have to be brought up to meet it.
+        for element in (
+            viewport.branch_queues[feed_name],
+            viewport.branch_crops[feed_name],
+        ):
+            if not element.sync_state_with_parent():
+                raise RuntimeDependencyError(
+                    f"could not start {element.get_name()}"
+                )
 
     def _request_feed_stop(self, feed_name: str, generation: int, reason: str) -> None:
         self.GLib.idle_add(self._stop_feed, feed_name, generation, reason)
@@ -636,6 +824,7 @@ class WallRuntime:
         if feed.generation != generation or feed.state in ("backoff", "unsupported"):
             return False
         feed.state = "healthy"
+        feed.healthy_at = time.monotonic()
         LOG.info("feed %s: video is healthy", feed_name)
         for viewport in self.viewports.values():
             active_healthy = (
@@ -656,6 +845,7 @@ class WallRuntime:
         feed = self.feeds[feed_name]
         if feed.generation == generation and feed.state == "healthy":
             feed.failures = 0
+            feed.short_lived_generations = 0
             feed.stable_source_id = None
         return False
 
@@ -761,37 +951,54 @@ class WallRuntime:
     def _connect_feed_branches(self) -> None:
         for viewport in self.viewports.values():
             for feed_name in viewport.config.feeds:
-                feed = self.feeds[feed_name]
-                safe_viewport = viewport.config.name.replace("-", "_")
-                safe_feed = feed_name.replace("-", "_")
-                queue = self._element("queue", f"queue_{safe_feed}_to_{safe_viewport}")
-                # A single buffer per branch throttles the tee; 4 measured best.
-                queue.set_property("max-size-buffers", 4)
-                queue.set_property("max-size-bytes", 0)
-                queue.set_property("max-size-time", 0)
-                self.Gst.util_set_object_arg(queue, "leaky", "downstream")
-                self.pipeline.add(queue)
+                self._connect_one_branch(viewport, feed_name)
 
-                # One videocrop per branch, before the selector. It sees a
-                # single decoder's caps for the lifetime of the branch, so the
-                # cropped caps kmssink sizes its pool from never change and a
-                # rotating viewport keeps its seam and its 1:1 plane.
-                crop = self._element("videocrop", f"crop_{safe_feed}_to_{safe_viewport}")
-                self.pipeline.add(crop)
-                viewport.branch_crops[feed_name] = crop
+    def _connect_one_branch(self, viewport: ViewportRuntime, feed_name: str) -> None:
+        """Wire one feed into one viewport, from the tee to the selector.
 
-                tee_pad = feed.tee.request_pad_simple("src_%u")
-                selector_pad = viewport.selector.request_pad_simple("sink_%u")
-                if tee_pad is None or selector_pad is None:
-                    raise RuntimeDependencyError("could not allocate GStreamer request pad")
-                if tee_pad.link(queue.get_static_pad("sink")) != self.Gst.PadLinkReturn.OK:
-                    raise RuntimeDependencyError(f"could not branch feed {feed_name}")
-                self._link_many(queue, crop)
-                if crop.get_static_pad("src").link(selector_pad) != self.Gst.PadLinkReturn.OK:
-                    raise RuntimeDependencyError(
-                        f"could not connect feed {feed_name} to viewport {viewport.config.name}"
-                    )
-                viewport.selector_pads[feed_name] = selector_pad
+        Used for the initial build and again when a wedged branch is rebuilt,
+        so the replacement is assembled by the same code as the original and
+        cannot drift from it.
+        """
+        feed = self.feeds[feed_name]
+        safe_viewport = viewport.config.name.replace("-", "_")
+        safe_feed = feed_name.replace("-", "_")
+        generation = viewport.branch_generation
+        suffix = "" if generation == 0 else f"_{generation}"
+        queue = self._element(
+            "queue", f"queue_{safe_feed}_to_{safe_viewport}{suffix}"
+        )
+        # A single buffer per branch throttles the tee; 4 measured best.
+        queue.set_property("max-size-buffers", 4)
+        queue.set_property("max-size-bytes", 0)
+        queue.set_property("max-size-time", 0)
+        self.Gst.util_set_object_arg(queue, "leaky", "downstream")
+        self.pipeline.add(queue)
+
+        # One videocrop per branch, before the selector. It sees a
+        # single decoder's caps for the lifetime of the branch, so the
+        # cropped caps kmssink sizes its pool from never change and a
+        # rotating viewport keeps its seam and its 1:1 plane.
+        crop = self._element(
+            "videocrop", f"crop_{safe_feed}_to_{safe_viewport}{suffix}"
+        )
+        self.pipeline.add(crop)
+        viewport.branch_crops[feed_name] = crop
+        viewport.branch_queues[feed_name] = queue
+
+        tee_pad = feed.tee.request_pad_simple("src_%u")
+        selector_pad = viewport.selector.request_pad_simple("sink_%u")
+        if tee_pad is None or selector_pad is None:
+            raise RuntimeDependencyError("could not allocate GStreamer request pad")
+        if tee_pad.link(queue.get_static_pad("sink")) != self.Gst.PadLinkReturn.OK:
+            raise RuntimeDependencyError(f"could not branch feed {feed_name}")
+        self._link_many(queue, crop)
+        if crop.get_static_pad("src").link(selector_pad) != self.Gst.PadLinkReturn.OK:
+            raise RuntimeDependencyError(
+                f"could not connect feed {feed_name} to viewport {viewport.config.name}"
+            )
+        viewport.selector_pads[feed_name] = selector_pad
+        viewport.branch_tee_pads[feed_name] = tee_pad
 
     def _select_initial_feeds(self) -> None:
         for viewport in self.viewports.values():
