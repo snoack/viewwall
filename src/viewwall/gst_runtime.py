@@ -78,6 +78,7 @@ class FeedRuntime:
     decoded_frames: int = 0
     observed_fps_applied: bool = False
     caps_fps_known: bool = False
+    watchdog_reported: bool = False
     video_linked: bool = False
     audio_linked: bool = False
     generation: int = 0
@@ -475,6 +476,7 @@ class WallRuntime:
         feed.max_frame_gap = None
         feed.observed_fps_applied = False
         feed.caps_fps_known = False
+        feed.watchdog_reported = False
         feed.decoded_frames = 0
         feed.video_linked = False
         feed.audio_linked = False
@@ -741,9 +743,14 @@ class WallRuntime:
         timeout = int(self.STALL_FRAMES / fps * 1000)
         timeout = max(self.MIN_STALL_TIMEOUT_MS, timeout)
         current = feed.watchdog.get_property("timeout")
-        if current == timeout:
+        if current == timeout and feed.watchdog_reported:
             return
+        # Reported even when the value does not change, which happens when the
+        # rate works out to the startup default -- 45 frames at 3fps is exactly
+        # it. Such a feed logged nothing at all, and a feed missing from the
+        # watchdog log is indistinguishable from one the scaling never reached.
         feed.watchdog.set_property("timeout", timeout)
+        feed.watchdog_reported = True
         LOG.info(
             "feed %s: %.3g fps, stall watchdog set to %.1fs",
             feed.config.name,

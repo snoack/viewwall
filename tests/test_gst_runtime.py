@@ -553,7 +553,11 @@ def _watchdog_feed(starting_ms: int = 15_000) -> object:
     element = _FakeElement("watchdog_cam", log)
     element.properties["timeout"] = starting_ms
     element.get_property = element.properties.get  # type: ignore[attr-defined]
-    return SimpleNamespace(config=SimpleNamespace(name="cam"), watchdog=element)
+    return SimpleNamespace(
+        config=SimpleNamespace(name="cam"),
+        watchdog=element,
+        watchdog_reported=False,
+    )
 
 
 def test_watchdog_scales_to_a_slow_camera() -> None:
@@ -571,6 +575,29 @@ def test_watchdog_tightens_for_a_fast_camera() -> None:
     runtime._apply_feed_watchdog(feed, 30.0)
     # 45 frames at 30fps is 1.5s, floored by the minimum.
     assert feed.watchdog.properties["timeout"] == WallRuntime.MIN_STALL_TIMEOUT_MS
+
+
+def test_a_watchdog_matching_the_default_is_still_reported(caplog) -> None:
+    # 45 frames at 3fps is exactly the startup default, so the value never
+    # changes and the feed logged nothing at all, indistinguishable from one
+    # the scaling had never reached. The wall's 3fps camera looked like a bug
+    # for that reason while being correctly protected the whole time.
+    runtime = object.__new__(WallRuntime)
+    feed = _watchdog_feed()
+    with caplog.at_level("INFO"):
+        runtime._apply_feed_watchdog(feed, 3.0)
+    assert "stall watchdog set to 15.0s" in caplog.text
+    assert feed.watchdog_reported
+
+
+def test_an_unchanged_watchdog_is_reported_only_once(caplog) -> None:
+    runtime = object.__new__(WallRuntime)
+    feed = _watchdog_feed()
+    runtime._apply_feed_watchdog(feed, 3.0)
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        runtime._apply_feed_watchdog(feed, 3.0)
+    assert "stall watchdog" not in caplog.text
 
 
 def test_watchdog_never_goes_below_the_floor() -> None:
@@ -616,6 +643,7 @@ def _observed_feed() -> object:
         max_frame_gap=None,
         observed_fps_applied=False,
         caps_fps_known=False,
+        watchdog_reported=False,
         decoded_frames=0,
         generation=0,
     )
