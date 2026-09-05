@@ -1,0 +1,31 @@
+Source: viewwall
+Section: video
+Priority: optional
+Maintainer: Sebastian Noack <sebastian.noack@gmail.com>
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: viewwall
+Architecture: all
+Depends: ${misc:Depends},
+         python3 (>= 3.11),
+         python3-gi,
+         gir1.2-gstreamer-1.0,
+         gir1.2-gst-plugins-base-1.0,
+         gstreamer1.0-plugins-base,
+         gstreamer1.0-plugins-good,
+         gstreamer1.0-plugins-bad,
+         gstreamer1.0-tools,
+         kms++-utils,
+         adduser
+Recommends: gstreamer1.0-libav
+Description: DRM/KMS camera wall for Raspberry Pi OS Lite
+ Viewwall renders RTSP camera feeds directly onto KMS overlay planes, with no
+ X11, Wayland, desktop environment, or software compositor. Each feed is
+ decoded once in hardware and scanned out on its own plane, so the video path
+ stays zero-copy. Built and tested against UniFi Protect, it works with any
+ camera or NVR that publishes RTSP.
+ .
+ Python builds and supervises a native GStreamer graph and never touches video
+ pixels. Feeds recover independently from RTSP loss, decoder stalls and EOS,
+ and the process itself is supervised by systemd.

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viewwall"
+version = "0.1.0"
+description = "A DRM/KMS camera wall for Raspberry Pi OS Lite"
+authors = [{ name = "Sebastian Noack" }]
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+
+[project.scripts]
+viewwall = "viewwall.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

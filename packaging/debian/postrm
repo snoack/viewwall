@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+purge)
+    # Configuration may hold the only copy of the RTSP credentials, so it is
+    # removed only on purge, never on remove.
+    rm -f /etc/viewwall/viewwall.toml
+    rmdir --ignore-fail-on-non-empty /etc/viewwall 2>/dev/null || true
+    if getent passwd viewwall >/dev/null; then
+        deluser --system viewwall >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

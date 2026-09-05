@@ -1,0 +1,38 @@
+[Unit]
+Description=DRM/KMS camera wall
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=viewwall
+Group=viewwall
+SupplementaryGroups=video render
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=GST_REGISTRY_1_0=/var/cache/viewwall/registry.bin
+Environment=XDG_CACHE_HOME=/var/cache/viewwall
+ExecStart=/usr/bin/viewwall --config /etc/viewwall/viewwall.toml run
+Restart=always
+RestartSec=5
+WatchdogSec=30
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+# The service only needs the DRM, V4L2, configuration, and network surfaces.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/viewwall
+CacheDirectory=viewwall
+DevicePolicy=closed
+# DRM (char 226) for the output planes and V4L2 (char 81) for the hardware
+# decoders. Allowed by class rather than by node so a different card number or
+# decoder node still works.
+DeviceAllow=char-drm rw
+DeviceAllow=char-video4linux rw
+
+[Install]
+WantedBy=multi-user.target

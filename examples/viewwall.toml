@@ -1,0 +1,76 @@
+# Everything not set here uses a built-in default, so a working configuration
+# is mostly feeds and viewports. Options are listed in README.md.
+#
+# The connector is discovered from kmsprint. With more than one connected, the
+# first is used; to pin one, or to drive several, add a [displays.<name>]
+# table with its id from "kmsprint -l".
+#
+# [drm] holds the card itself -- which node to open ("/dev/dri/card0") and how
+# often to re-probe it for a resolution change. It is one card however many
+# displays are attached.
+
+[display_defaults]
+# Applies to every display, including the single discovered one. Driving more
+# than one screen adds a [displays.<name>] table per output, each naming its
+# connector_id, and every viewport names the display it is on.
+#
+# A one-pixel seam between viewports, made by clipping that pixel off the source
+# rather than drawing a border, so every plane still scans out 1:1. Defaults
+# to 0, meaning viewports butt against each other.
+gap_px = 1
+
+# These are UniFi Protect URLs, which are not quite what the Protect app shows:
+# drop its "?enableSrtp" and use port 7447. See "Describe the wall" in
+# README.md. Cameras that want a login take it inline instead:
+#   uri = "rtsp://user:password@192.168.1.10/stream1"
+
+[feeds.porch]
+uri = "rtsp://192.168.1.1:7447/aBcDeFgHiJkLmNoP"
+
+[feeds.driveway]
+uri = "rtsp://192.168.1.1:7447/QrStUvWxYzAbCdEf"
+
+[feeds.doorbell]
+uri = "rtsp://192.168.1.1:7447/GhIjKlMnOpQrStUv"
+
+[feeds.yard]
+uri = "rtsp://192.168.1.1:7447/WxYzAbCdEfGhIjKl"
+
+[feeds.chicken_run]
+uri = "rtsp://192.168.1.1:7447/MnOpQrStUvWxYzAb"
+
+[[viewports]]
+x = 0
+y = 0
+width = "1/3"
+height = "1/3"
+feeds = ["porch"]
+
+[[viewports]]
+x = "1/3"
+y = 0
+width = "1/3"
+height = "1/3"
+feeds = ["driveway"]
+
+[[viewports]]
+x = "2/3"
+y = 0
+width = "1/3"
+height = "1/3"
+feeds = ["doorbell"]
+
+[[viewports]]
+x = 0
+y = "1/3"
+width = "2/3"
+height = "2/3"
+feeds = ["yard"]
+
+[[viewports]]
+x = "2/3"
+y = "1/3"
+width = "1/3"
+height = "2/3"
+# Several feeds rotate. rotate_seconds sets the interval; it defaults to 8.
+feeds = ["chicken_run", "porch"]

@@ -1,0 +1,6 @@
+.git
+dist
+tests
+.pytest_cache
+__pycache__
+*.h264
