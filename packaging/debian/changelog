@@ -1,3 +1,23 @@
+viewwall (0.1.2-1) unstable; urgency=medium
+
+  * Paint under the viewports so the framebuffer console no longer shows
+    through the gaps, the outer margin, or a viewport whose feeds are all
+    down. Configured with drm.background, which takes a hex colour or "none".
+  * Add displays.<name>.mode, driving an output at a chosen resolution and
+    letting the screen scale it back. Worth setting when the grid does not
+    divide the native mode into tiles the size the cameras send.
+  * Stop requiring displays.<name>.connector_id when only one display is
+    configured, since there is nothing to disambiguate.
+  * Report what each viewport actually presents. The metrics line gains
+    presented_fps and sink_dropped, which count frames reaching the KMS plane
+    rather than frames leaving the queue: on a nine viewport wall those differ
+    by four to one.
+  * Rename the queue side rate to queued_fps. The journal field VW_FPS is
+    gone, replaced by VW_QUEUED_FPS and VW_PRESENTED_FPS; a saved journalctl
+    query naming the old field needs updating.
+
+ -- Sebastian Noack <sebastian.noack@gmail.com>  Sun, 06 Sep 2026 01:55:56 -0400
+
 viewwall (0.1.1-1) unstable; urgency=medium
 
   * Recover a feed whose branch wedges after repeated restarts, instead of
