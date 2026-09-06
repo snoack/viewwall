@@ -98,6 +98,37 @@ _SYSFS_DRM = Path("/sys/class/drm")
 _MODE_RE = re.compile(r"^(\d+)x(\d+)")
 
 
+def available_modes(
+    connector_id: int, sysfs_root: Path = _SYSFS_DRM
+) -> set[tuple[int, int]]:
+    """Every mode a connector advertises, from sysfs.
+
+    Used to reject a configured mode before the wall is built. Setting one the
+    display cannot show otherwise fails deep in kmssink as "Internal data
+    stream error", which names neither the mode nor the option that chose it.
+
+    An empty set means sysfs said nothing, not that nothing is supported, so
+    callers must treat it as unknown rather than as a rejection.
+    """
+    modes: set[tuple[int, int]] = set()
+    try:
+        connectors = sorted(sysfs_root.glob("card*-*"))
+    except OSError:
+        return modes
+    for connector in connectors:
+        try:
+            if int((connector / "connector_id").read_text().strip()) != connector_id:
+                continue
+            lines = (connector / "modes").read_text().splitlines()
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        for line in lines:
+            match = _MODE_RE.match(line.strip())
+            if match:
+                modes.add((int(match.group(1)), int(match.group(2))))
+    return modes
+
+
 def current_modes(sysfs_root: Path = _SYSFS_DRM) -> dict[int, tuple[int, int]]:
     """Active mode per connector id, read from sysfs.
 
@@ -175,10 +206,11 @@ def detect_displays(
     used_connectors: set[int] = set()
     for config in configs:
         if config.connector_id is None:
-            # Only a lone unconfigured display omits a connector, so this is
-            # the no-[displays] case. Other screens may well be attached: the
-            # first connected one is used and the rest are left alone, which
-            # is what driving them requires a table to say.
+            # A single display may omit the connector, whether or not it has
+            # a table: with one of them there is nothing to disambiguate.
+            # Other screens may well be attached: the first connected one is
+            # used and the rest are left alone, which is what driving them
+            # requires a table of their own to say.
             state = states[0]
         else:
             state = by_connector.get(config.connector_id)

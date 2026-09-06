@@ -569,6 +569,102 @@ uri = "rtsp://nvr.invalid/feed"
     assert config.drm.poll_interval_seconds == 30
 
 
+def test_one_display_needs_no_connector_id(tmp_path: Path) -> None:
+    """A single table has no ambiguity to resolve.
+
+    It describes the one display, exactly as the no-table case does, so
+    naming it should not require looking an id up in kmsprint.
+    """
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[displays.main]
+mode = "1280x720"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    config = load_config(config_path, {})
+    assert config.displays[0].connector_id is None
+    assert config.displays[0].mode == (1280, 720)
+
+
+def test_several_displays_still_need_connector_ids(tmp_path: Path) -> None:
+    # With two, which screen shows what would depend on probe order.
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[displays.main]
+[displays.hall]
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="more than one display"):
+        load_config(config_path, {})
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [("1280x720", (1280, 720)), ("800x600", (800, 600)), ("  640x480  ", (640, 480))],
+)
+def test_mode_is_parsed(tmp_path: Path, written: str, expected) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        f"""
+[displays.main]
+connector_id = 35
+mode = "{written}"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).displays[0].mode == expected
+
+
+def test_mode_defaults_to_keeping_the_current_one(tmp_path: Path) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).displays[0].mode is None
+
+
+@pytest.mark.parametrize("written", ["1280", "1280X720", "abc", "0x600", "1280x"])
+def test_mode_rejects_anything_but_width_by_height(
+    tmp_path: Path, written: str
+) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        f"""
+[displays.main]
+connector_id = 35
+mode = "{written}"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="mode"):
+        load_config(config_path, {})
+
+
 def test_background_defaults_to_black(tmp_path: Path) -> None:
     config_path = tmp_path / "viewwall.toml"
     config_path.write_text(

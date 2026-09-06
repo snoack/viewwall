@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from viewwall.display import DisplayState
 from viewwall.gst_runtime import RuntimeDependencyError, WallRuntime
 from viewwall.layout import PixelRect, SourceCrop
 
@@ -478,7 +479,118 @@ def test_build_viewports_and_branches_construct_without_undefined_names() -> Non
     assert any(name.startswith("crop_coop_to_viewport2") for name in made)
 
 
-def _background_runtime(colour: str | None, *, missing: bool = False):
+def _modes_runtime(mode, background="#000000", probed=(1920, 1080)):
+    runtime = object.__new__(WallRuntime)
+    runtime.displays = {
+        "main": DisplayState(
+            connector_id=35,
+            crtc_index=3,
+            crtc_id=97,
+            width=probed[0],
+            height=probed[1],
+            plane_ids=(98, 109),
+        )
+    }
+    runtime.config = SimpleNamespace(
+        displays=(SimpleNamespace(name="main", mode=mode),),
+        drm=SimpleNamespace(background=background),
+    )
+    return runtime
+
+
+def test_unsupported_mode_is_refused_by_name(monkeypatch) -> None:
+    """Otherwise kmssink fails with "Internal data stream error".
+
+    That names neither the mode nor the option that chose it, and the wall
+    comes up laid out for a size the screen never reaches.
+    """
+    runtime = _modes_runtime((1234, 567))
+    monkeypatch.setattr(
+        "viewwall.gst_runtime.available_modes",
+        lambda cid: {(1920, 1080), (1280, 720)},
+    )
+    with pytest.raises(RuntimeDependencyError, match="1234x567 is not offered"):
+        runtime._apply_configured_modes()
+
+
+def test_supported_mode_passes(monkeypatch) -> None:
+    runtime = _modes_runtime((1280, 720))
+    monkeypatch.setattr(
+        "viewwall.gst_runtime.available_modes",
+        lambda cid: {(1920, 1080), (1280, 720)},
+    )
+    runtime._apply_configured_modes()
+    assert (runtime.displays["main"].width, runtime.displays["main"].height) == (
+        1280,
+        720,
+    )
+
+
+def test_mode_is_not_rejected_when_sysfs_says_nothing(monkeypatch) -> None:
+    # An empty set means unknown, not unsupported.
+    runtime = _modes_runtime((1280, 720))
+    monkeypatch.setattr("viewwall.gst_runtime.available_modes", lambda cid: set())
+    runtime._apply_configured_modes()
+    assert runtime.displays["main"].width == 1280
+
+
+def test_background_errors_do_not_kill_the_wall(caplog) -> None:
+    """The one element the wall does not need."""
+    runtime = object.__new__(WallRuntime)
+    runtime.background_sinks = {"main": object()}
+    assert runtime._is_background_source(
+        SimpleNamespace(get_name=lambda: "background_src_main")
+    )
+    assert runtime._is_background_source(
+        SimpleNamespace(get_name=lambda: "kms_background_main")
+    )
+    # A viewport sink is not the background and must stay fatal.
+    assert not runtime._is_background_source(
+        SimpleNamespace(get_name=lambda: "kms_viewport3_0")
+    )
+    runtime.background_sinks = {}
+    assert not runtime._is_background_source(
+        SimpleNamespace(get_name=lambda: "background_src_main")
+    )
+
+
+def test_configured_mode_replaces_the_probed_size() -> None:
+    """Rectangles are computed from these numbers before the mode is set."""
+    runtime = _modes_runtime((1280, 720))
+    runtime._apply_configured_modes()
+    state = runtime.displays["main"]
+    assert (state.width, state.height) == (1280, 720)
+    # Only the size changes; the plane and connector identity does not.
+    assert state.plane_ids == (98, 109)
+    assert state.connector_id == 35
+    assert state.crtc_id == 97
+
+
+def test_no_mode_keeps_what_was_probed() -> None:
+    runtime = _modes_runtime(None)
+    runtime._apply_configured_modes()
+    assert (runtime.displays["main"].width, runtime.displays["main"].height) == (
+        1920,
+        1080,
+    )
+
+
+def test_mode_matching_the_probe_is_not_reported(caplog) -> None:
+    runtime = _modes_runtime((1920, 1080))
+    with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
+        runtime._apply_configured_modes()
+    assert "mode" not in caplog.text
+
+
+def test_mode_applies_without_a_background_colour() -> None:
+    """The sink is a vehicle for the modeset; painting is the other job."""
+    runtime = _modes_runtime((1280, 720), background=None)
+    runtime._apply_configured_modes()
+    state = runtime.displays["main"]
+    assert (state.width, state.height) == (1280, 720)
+
+
+def _background_runtime(colour: str | None, *, missing: bool = False, mode=None):
     """A runtime stripped to what _build_background touches."""
     made: list[str] = []
     props: dict[str, object] = {}
@@ -504,7 +616,10 @@ def _background_runtime(colour: str | None, *, missing: bool = False):
     runtime.displays = {
         "main": SimpleNamespace(connector_id=35, width=1920, height=1080)
     }
-    runtime.config = SimpleNamespace(drm=SimpleNamespace(background=colour))
+    runtime.config = SimpleNamespace(
+        drm=SimpleNamespace(background=colour),
+        displays=(SimpleNamespace(name="main", mode=mode),),
+    )
     runtime.background_sinks = {}
 
     def _element(factory: str, name: str):
@@ -549,6 +664,24 @@ def test_background_source_stays_live() -> None:
     runtime, _made, props = _background_runtime("#000000")
     runtime._build_background()
     assert props["background_src_main.is-live"] is True
+
+
+def test_mode_only_builds_the_sink_without_a_colour() -> None:
+    """background = "none" with a mode still needs the modeset element."""
+    runtime, made, props = _background_runtime(None, mode=(1280, 720))
+    runtime._build_background()
+    assert set(runtime.background_sinks) == {"main"}
+    assert props["kms_background_main.force-modesetting"] is True
+    # Opaque black behind tiles that cover it anyway; the alpha byte still
+    # has to be set or videotestsrc reads the colour as transparent.
+    assert props["background_src_main.foreground-color"] == 0xFF000000
+
+
+def test_mode_only_says_so_rather_than_naming_a_colour(caplog) -> None:
+    runtime, _made, _props = _background_runtime(None, mode=(1280, 720))
+    with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
+        runtime._build_background()
+    assert "modeset only" in caplog.text
 
 
 def test_background_none_builds_nothing() -> None:

@@ -53,6 +53,7 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # spelling this refuses. Also catches signs and non-ASCII digits.
 _NOT_FRACTION_RE = re.compile(r"[^0-9/]")
 _HEX_COLOUR_RE = re.compile(r"^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$")
+_MODE_RE = re.compile(r"^(\d{1,5})x(\d{1,5})$")
 
 
 def parse_fraction(value: object, field: str) -> Fraction:
@@ -173,6 +174,12 @@ class DisplayConfig:
     connector_id: int | None = None
     width: int | None = None
     height: int | None = None
+    # The mode to drive the connector at, as (width, height), or None to keep
+    # whatever it is already showing. Unlike width/height, which only say what
+    # to lay out against, this changes what the screen scans out; the panel
+    # scales it back up. Worth setting when the grid does not divide the
+    # native mode into tiles the size the cameras send.
+    mode: tuple[int, int] | None = None
     gap_px: int = 0
     outer_margin_px: int = 0
 
@@ -292,6 +299,28 @@ def _positive_number(value: object, field: str) -> float:
     return float(value)
 
 
+def _mode(value: object, field: str) -> tuple[int, int] | None:
+    """Parse a display mode written as WIDTHxHEIGHT.
+
+    Distinct from width/height, which only say what resolution to lay out
+    against. This one is set on the connector, so the screen really does
+    change what it scans out and the panel scales it back to its own size.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{field}.mode must be a string like \"1280x720\"")
+    match = _MODE_RE.match(value.strip())
+    if match is None:
+        raise ConfigError(
+            f'{field}.mode must look like "1280x720", not {value!r}'
+        )
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        raise ConfigError(f"{field}.mode dimensions must be positive")
+    return width, height
+
+
 def _background(value: object) -> str | None:
     """Normalise drm.background into a colour, or None to leave the console.
 
@@ -354,7 +383,7 @@ _DRM_KEYS = frozenset({"device", "poll_interval_seconds", "background"})
 # display that does not say otherwise, including the discovered one.
 _DISPLAY_DEFAULT_KEYS = frozenset({"gap_px", "outer_margin_px"})
 _DISPLAY_KEYS = (
-    frozenset({"connector_id", "width", "height"}) | _DISPLAY_DEFAULT_KEYS
+    frozenset({"connector_id", "width", "height", "mode"}) | _DISPLAY_DEFAULT_KEYS
 )
 _METRICS_KEYS = frozenset({"interval_seconds"})
 _FEED_DEFAULT_KEYS = frozenset({"latency_ms", "transport", "verify_tls"})
@@ -451,6 +480,7 @@ def load_config(path: str | Path, environ: Mapping[str, str] | None = None) -> A
             connector_id=connector_id,
             width=width,
             height=height,
+            mode=_mode(display_raw.get("mode"), field),
             gap_px=spacing("gap_px"),
             outer_margin_px=spacing("outer_margin_px"),
         )
@@ -469,11 +499,16 @@ def load_config(path: str | Path, environ: Mapping[str, str] | None = None) -> A
             field = f"displays.{name}"
             display_raw = _mapping(value, field, _DISPLAY_KEYS)
             display = _display(display_raw, field, name)
-            if display.connector_id is None:
-                # Naming a display at all means saying which one, otherwise
-                # which screen shows what would depend on the order the probe
-                # happened to list connectors in.
-                raise ConfigError(f"{field}.connector_id is required")
+            if display.connector_id is None and len(displays_raw) > 1:
+                # With two of them, which screen shows what would otherwise
+                # depend on the order the probe happened to list connectors
+                # in. A single table has no such ambiguity: it describes the
+                # one display, exactly as the no-table case does, and saying
+                # so should not require looking an id up in kmsprint.
+                raise ConfigError(
+                    f"{field}.connector_id is required when more than one "
+                    "display is configured"
+                )
             if display.connector_id in seen_connectors:
                 raise ConfigError(
                     f"displays {seen_connectors[display.connector_id]} and "

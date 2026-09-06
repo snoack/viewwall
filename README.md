@@ -148,10 +148,11 @@ seam does not mean naming a screen.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `connector_id` | required | Which output this is. `kmsprint -l` lists them as `Connector 0 (35) HDMI-A-1 (connected)`, where `35` is the id, and the startup log line names the ones in use. Naming a display means saying which one: otherwise which screen showed what would depend on probe order. |
+| `connector_id` | the first connected output | Which output this is. Required only when more than one display is configured. With a single one the first connected output is driven and any others are left alone, which is the same choice made when there is no `[displays]` table at all. `kmsprint -l` lists them as `Connector 0 (35) HDMI-A-1 (connected)`, where `35` is the id, and the startup log line names the ones in use. With several displays, which screen showed what would otherwise depend on probe order. |
 | `gap_px` | `0` | Seam between viewports, in pixels. Made by trimming that pixel off the edge of the video rather than drawing over it, so the picture is never scaled and every plane stays on the cheap 1:1 path. |
 | `outer_margin_px` | `0` | Inset from this screen's edges. |
 | `width`, `height` | active mode | Overrides the detected resolution. Both or neither. |
+| `mode` | the current mode | Drive this output at `"WIDTHxHEIGHT"` instead of what it is already showing, letting the screen scale the result back up. Set it when the grid does not divide the native mode into tiles the size the cameras send: a 2x2 wall of 640x360 feeds fills 1280x720 exactly, and upscales every tile by half on a 1080p panel for no extra detail. Works with `background = "none"`: the same sink performs the modeset either way, and simply paints nothing visible behind the tiles. |
 
 **`[display_defaults]`** — `gap_px` and `outer_margin_px` for any display that
 does not set its own, including the discovered one.

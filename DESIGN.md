@@ -159,6 +159,43 @@ Judge stability by whether `NRestarts` stays flat, not by a single `kmsprint`:
 a wall that exceeds the scaler budget reaches all nine planes and then dies, so
 a point-in-time check can look healthy moments before a failure.
 
+### Output mode
+
+`displays.<name>.mode` drives a connector at a chosen resolution rather than
+the one it came up in. The panel scales the result back to its own size, so
+the wall still fills the screen.
+
+This is not the same as `width`/`height`, which only say what resolution to
+lay out against. Setting those smaller shrinks the wall into a corner of an
+unchanged signal; setting `mode` changes the signal.
+
+It is worth setting when the grid does not divide the native mode into tiles
+the size the cameras actually send. A 3x3 wall of 640x360 feeds fills
+1920x1080 exactly, which is why the default needs nothing. A 2x2 wall of the
+same feeds wants 1280x720: on a 1080p panel every tile is upscaled by half,
+spending scaler budget and latency to invent detail the source never had.
+
+The mode is applied by the background sink, which is already the one element
+doing `force-modesetting`. The two jobs are independent: `background = "none"`
+with a `mode` set still builds the sink, which then paints opaque black behind
+tiles that cover it anyway. `_apply_configured_modes` replaces the probed size
+before anything is built, because every rectangle is computed from it and
+tiles sized for the old mode would hang off the edge of the new one.
+
+The resolution poll keeps running with a mode set, because the display can
+still renegotiate underneath it: unplugged, power cycled, switched. What the
+poll compares had to change, though. sysfs `modes` lists a connector's
+*available* modes and its first line is the preferred one, not the active one,
+so it keeps reporting 1920x1080 while the CRTC runs at 1280x720. Comparing it
+against the size being laid out therefore mismatched on every tick and
+escalated to the full `kmsprint` probe, which takes 6.4s under load. The poll
+compares against what the last full probe saw instead, so a mode set by this
+process matches while a display renegotiating still does not.
+
+Measured presented framerate does not change with the mode: the CRTC retires
+about 60 plane commits a second whatever it is scanning out, so nine
+viewports still get about 7.4 each. See the plane budget section.
+
 ### Background
 
 Only the viewport rectangles are ever drawn. Below them the primary plane still

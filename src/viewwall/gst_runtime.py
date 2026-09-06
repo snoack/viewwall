@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 import logging
 import os
@@ -19,7 +19,12 @@ from .config import (
     FeedConfig,
     ViewportConfig,
 )
-from .display import DisplayState, current_modes, detect_displays
+from .display import (
+    DisplayState,
+    available_modes,
+    current_modes,
+    detect_displays,
+)
 from .journal import format_fields
 from .layout import ResolvedViewport, SourceCrop, resolve_layout
 
@@ -168,6 +173,14 @@ class WallRuntime:
             if displays is not None
             else detect_displays(config.displays, demand)
         )
+        # What the connector reported, kept separate from what is laid out:
+        # a configured mode replaces the latter, and the resolution poll has
+        # to compare against the former to notice a display renegotiating.
+        self._probed = {
+            name: (state.width, state.height)
+            for name, state in self.displays.items()
+        }
+        self._apply_configured_modes()
         for display in config.displays:
             state = self.displays[display.name]
             if len(state.plane_ids) < demand[display.name]:
@@ -201,6 +214,50 @@ class WallRuntime:
             # the DRM fd, so let it run rather than relying on that.
             self.close()
             raise
+
+    def _apply_configured_modes(self) -> None:
+        """Lay out against the configured mode rather than the probed one.
+
+        The probe reports what the connector is showing now, which is not
+        what it will be showing once the background sink sets the mode. Every
+        rectangle is computed from these numbers, so they have to be replaced
+        before anything is built or the tiles would be sized for the old mode
+        and hang off the edge of the new one.
+
+        Only the size is replaced. Plane ids, the connector and the CRTC do
+        not change with the mode.
+        """
+        for display in (d for d in self.config.displays if d.mode is not None):
+            state = self.displays.get(display.name)
+            if state is None:
+                continue
+            width, height = display.mode  # type: ignore[misc]
+            if (state.width, state.height) == (width, height):
+                continue
+            # Refuse a mode the display does not advertise. kmssink would
+            # otherwise fail with "Internal data stream error", which names
+            # neither the mode nor the option that chose it, and the wall
+            # would come up laid out for a size never reached. An empty set
+            # means sysfs said nothing, so nothing is rejected on it.
+            supported = available_modes(state.connector_id)
+            if supported and (width, height) not in supported:
+                offered = ", ".join(
+                    f"{w}x{h}" for w, h in sorted(supported, reverse=True)
+                )
+                raise RuntimeDependencyError(
+                    f"display {display.name}: mode {width}x{height} is not "
+                    f"offered by connector {state.connector_id}; it offers "
+                    f"{offered}"
+                )
+            LOG.info(
+                "display %s: mode %dx%d (was %dx%d)",
+                display.name,
+                width,
+                height,
+                state.width,
+                state.height,
+            )
+            self.displays[display.name] = replace(state, width=width, height=height)
 
     @property
     def display(self) -> DisplayState:
@@ -318,9 +375,16 @@ class WallRuntime:
         far has shipped, and it beats no wall at all.
         """
         colour = self.config.drm.background
-        if colour is None:
+        modes = {d.name for d in self.config.displays if d.mode is not None}
+        # The same sink serves both jobs. Painting needs a colour; setting a
+        # mode needs only the modeset, so a display naming one is built even
+        # with the background off, and simply paints black behind tiles that
+        # cover it anyway.
+        if colour is None and not modes:
             return
         for display_name, state in self.displays.items():
+            if colour is None and display_name not in modes:
+                continue
             safe = display_name.replace("-", "_")
             try:
                 source = self._element("videotestsrc", f"background_src_{safe}")
@@ -352,7 +416,14 @@ class WallRuntime:
             source.set_property("is-live", True)
             # videotestsrc takes 0xAARRGGBB and reads a zero alpha byte as
             # fully transparent, so the colour has to carry one.
-            source.set_property("foreground-color", 0xFF000000 | int(colour[1:], 16))
+            source.set_property(
+                "foreground-color",
+                0xFF000000 | (int(colour[1:], 16) if colour is not None else 0),
+            )
+            # kmssink takes the mode from these caps, so this is also what
+            # sets the connector's mode when one is configured. state.width
+            # and state.height already carry it: _apply_mode() replaced the
+            # probed values before any of this was built.
             filt.set_property(
                 "caps",
                 self.Gst.Caps.from_string(
@@ -363,7 +434,11 @@ class WallRuntime:
             self._add(source, filt, sink)
             self._link_many(source, filt, sink)
             self.background_sinks[display_name] = sink
-            LOG.info("display %s: background %s", display_name, colour)
+            LOG.info(
+                "display %s: %s",
+                display_name,
+                f"background {colour}" if colour is not None else "modeset only",
+            )
 
     def _build_viewports(self) -> None:
         next_plane = {name: 0 for name in self.displays}
@@ -1517,12 +1592,15 @@ class WallRuntime:
         }
         if len(pinned) < len(self.config.displays):
             modes = current_modes()
+            # Against what the connector reports, not against the size being
+            # laid out: with displays.<name>.mode set those differ by design,
+            # and comparing the two would escalate to the expensive probe on
+            # every tick. _probed holds what the last full probe saw, so a
+            # display renegotiating -- unplugged, power cycled, switched --
+            # still stops matching and is still caught.
             if modes and all(
                 modes.get(self.displays[display.name].connector_id)
-                == (
-                    self.displays[display.name].width,
-                    self.displays[display.name].height,
-                )
+                == self._probed.get(display.name)
                 for display in self.config.displays
                 if display.name not in pinned
             ):
@@ -1539,6 +1617,24 @@ class WallRuntime:
         for display in self.config.displays:
             was = self.displays[display.name]
             now = current[display.name]
+            probed_before = self._probed.get(display.name)
+            self._probed[display.name] = (now.width, now.height)
+            if display.mode is not None:
+                # The size laid out is the configured one and does not follow
+                # the connector, so compare what the probe saw instead. The
+                # mode itself is not reapplied here: the sink that set it is
+                # still holding the CRTC.
+                if probed_before == (now.width, now.height):
+                    continue
+                LOG.info(
+                    "display %s: connector now %dx%d, still laying out %dx%d",
+                    display.name,
+                    now.width,
+                    now.height,
+                    was.width,
+                    was.height,
+                )
+                continue
             if (now.width, now.height) == (was.width, was.height):
                 continue
             LOG.info(
@@ -1565,6 +1661,13 @@ class WallRuntime:
                 self._fatal(str(exc))
                 return False
         return True
+
+    def _is_background_source(self, source: Any) -> bool:
+        """Whether an errored element belongs to the background, not a feed."""
+        if source is None or not self.background_sinks:
+            return False
+        name = source.get_name() or ""
+        return name.startswith("background_") or name.startswith("kms_background_")
 
     def _feed_identity_for_source(self, source: Any) -> tuple[str, int] | None:
         current = source
@@ -1604,6 +1707,16 @@ class WallRuntime:
                 LOG.debug("GStreamer error details: %s", debug)
             identity = self._feed_identity_for_source(message.src)
             if identity is None:
+                if self._is_background_source(message.src):
+                    # The background is the one element the wall does not
+                    # need. Losing it costs the console showing through, and
+                    # a configured mode, but the video keeps running; taking
+                    # the wall down over it would be the worse outcome.
+                    LOG.warning(
+                        "background failed and is being left down: %s",
+                        error.message,
+                    )
+                    return
                 self._fatal(f"GStreamer error from {source_name}: {error.message}")
             else:
                 self._request_feed_restart(
