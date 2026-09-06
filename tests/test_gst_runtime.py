@@ -627,7 +627,14 @@ def _lateness_runtime(pts_ns: int, now_ns: int, base_ns: int):
         get_clock=lambda: clock, get_base_time=lambda: base_ns
     )
     viewport = SimpleNamespace(
-        sink=sink, lateness_ms_total=0.0, lateness_samples=0, lateness_ms_max=0.0
+        sink=sink,
+        lateness_ms_total=0.0,
+        lateness_samples=0,
+        lateness_ms_max=0.0,
+        # 1, so the very next buffer is the sampled one.
+        lateness_countdown=1,
+        lateness_clock=None,
+        lateness_base=0,
     )
     info = SimpleNamespace(get_buffer=lambda: SimpleNamespace(pts=pts_ns))
     return runtime, viewport, info
@@ -650,6 +657,7 @@ def test_lateness_keeps_the_worst_of_the_interval() -> None:
     )
     runtime._observe_lateness(viewport, info)
     later = SimpleNamespace(get_buffer=lambda: SimpleNamespace(pts=400_000_000))
+    viewport.lateness_countdown = 1
     runtime._observe_lateness(viewport, later)
     assert viewport.lateness_samples == 2
     # The second buffer is only 100ms late, so the maximum stands.
@@ -677,11 +685,49 @@ def test_lateness_survives_a_viewport_without_a_clock() -> None:
         pts_ns=300_000_000, now_ns=1_500_000_000, base_ns=1_000_000_000
     )
     viewport.sink = SimpleNamespace(get_clock=lambda: None, get_base_time=lambda: 0)
+    viewport.lateness_countdown = 1
     runtime._observe_lateness(viewport, info)
     assert viewport.lateness_samples == 0
     viewport.sink = None
+    viewport.lateness_countdown = 1
     runtime._observe_lateness(viewport, info)
     assert viewport.lateness_samples == 0
+
+
+def test_lateness_samples_rather_than_measures_every_buffer() -> None:
+    """Measuring every buffer cost ten points of a Pi 3 core.
+
+    Each PyGObject call from the probe costs microseconds and this runs on
+    every buffer of every viewport, so only one in LATENESS_SAMPLE_EVERY
+    carries the measurement.
+    """
+    runtime, viewport, info = _lateness_runtime(
+        pts_ns=300_000_000, now_ns=1_500_000_000, base_ns=1_000_000_000
+    )
+    for _ in range(WallRuntime.LATENESS_SAMPLE_EVERY * 3):
+        runtime._observe_lateness(viewport, info)
+    assert viewport.lateness_samples == 3
+
+
+def test_lateness_clock_is_read_once_per_sink() -> None:
+    """The clock and base time are fixed for a sink's lifetime."""
+    calls = []
+    runtime, viewport, info = _lateness_runtime(
+        pts_ns=300_000_000, now_ns=1_500_000_000, base_ns=1_000_000_000
+    )
+    clock = viewport.sink.get_clock()
+
+    def _counted_clock():
+        calls.append(1)
+        return clock
+
+    viewport.sink = SimpleNamespace(
+        get_clock=_counted_clock, get_base_time=lambda: 1_000_000_000
+    )
+    for _ in range(WallRuntime.LATENESS_SAMPLE_EVERY * 4):
+        runtime._observe_lateness(viewport, info)
+    assert viewport.lateness_samples == 4
+    assert len(calls) == 1
 
 
 def test_lateness_reported_only_when_frames_are_lost(caplog, monkeypatch) -> None:
@@ -951,6 +997,9 @@ def _metrics_runtime(queue_ns: int | None = 45_000_000) -> WallRuntime:
             lateness_ms_total=0.0,
             lateness_samples=0,
             lateness_ms_max=0.0,
+            lateness_countdown=1,
+            lateness_clock=None,
+            lateness_base=0,
         )
     }
     runtime.feeds = {
@@ -1037,6 +1086,9 @@ def test_a_feed_in_two_viewports_reports_in_both(
         lateness_ms_total=0.0,
         lateness_samples=0,
         lateness_ms_max=0.0,
+        lateness_countdown=1,
+        lateness_clock=None,
+        lateness_base=0,
     )
     monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
     with caplog.at_level("INFO", logger="viewwall.gst_runtime"):

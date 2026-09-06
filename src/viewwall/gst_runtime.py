@@ -126,6 +126,10 @@ class ViewportRuntime:
     lateness_ms_total: float = 0.0
     lateness_samples: int = 0
     lateness_ms_max: float = 0.0
+    lateness_countdown: int = 1
+    # Cleared with the sink, which is replaced on every outage.
+    lateness_clock: Any = None
+    lateness_base: int = 0
 
 
 class WallRuntime:
@@ -146,6 +150,11 @@ class WallRuntime:
     # Consecutive such generations before saying so. One is a coincidence --
     # a camera can drop just after connecting -- and a run of them is not.
     SHORT_GENERATION_LIMIT = 3
+
+    # One buffer in this many carries the lateness measurement. At 30fps
+    # that is roughly two samples a second, or 120 across a metrics
+    # interval, which is ample for a mean and a worst case.
+    LATENESS_SAMPLE_EVERY = 16
 
     STALL_FRAMES = 45
     MIN_STALL_TIMEOUT_MS = 5_000
@@ -1195,6 +1204,10 @@ class WallRuntime:
                 f"could not start replacement KMS sink for viewport {viewport.config.name}"
             )
         viewport.sink = new_sink
+        # The replacement starts its own clock and base time; a cached pair
+        # from the spent sink would read every buffer as wildly late.
+        viewport.lateness_clock = None
+        viewport.lateness_base = 0
 
     def _show_viewport_offline(self, viewport: ViewportRuntime) -> None:
         was_active = viewport.active_feed is not None
@@ -1703,16 +1716,34 @@ class WallRuntime:
         buffer: a viewport whose clock is not yet running simply records
         nothing this interval.
         """
+        # Every crossing into C here costs microseconds, and this runs on
+        # every buffer of every viewport: measuring all of them cost ten
+        # points of a core on a Pi 3, against under one for the counter
+        # alone. One buffer in LATENESS_SAMPLE_EVERY is plenty for a mean
+        # and a maximum over a 60 second interval, and reduces the cost to
+        # noise.
+        viewport.lateness_countdown -= 1
+        if viewport.lateness_countdown > 0:
+            return
+        viewport.lateness_countdown = self.LATENESS_SAMPLE_EVERY
         element = viewport.sink
         if element is None:
             return
         buffer = info.get_buffer()
-        if buffer is None or buffer.pts == self.Gst.CLOCK_TIME_NONE:
+        if buffer is None:
             return
-        clock = element.get_clock()
+        pts = buffer.pts
+        if pts == self.Gst.CLOCK_TIME_NONE:
+            return
+        # The clock and base time are fixed for the life of a sink, so they
+        # are read once per sink rather than once per buffer.
+        if viewport.lateness_clock is None:
+            viewport.lateness_clock = element.get_clock()
+            viewport.lateness_base = element.get_base_time()
+        clock = viewport.lateness_clock
         if clock is None:
             return
-        base_time = element.get_base_time()
+        base_time = viewport.lateness_base
         if base_time == self.Gst.CLOCK_TIME_NONE:
             return
         now = clock.get_time()
@@ -1721,7 +1752,7 @@ class WallRuntime:
         # Running time, the same conversion basesink makes before comparing
         # against the clock. Segment offsets are not applied: the pipeline
         # runs a plain live segment per feed, so pts is already running time.
-        late_ns = (now - base_time) - buffer.pts
+        late_ns = (now - base_time) - pts
         late_ms = late_ns / 1_000_000.0
         viewport.lateness_ms_total += late_ms
         viewport.lateness_samples += 1
