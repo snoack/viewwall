@@ -1,3 +1,4 @@
+import logging
 import socket
 import time
 from fractions import Fraction
@@ -475,6 +476,95 @@ def test_build_viewports_and_branches_construct_without_undefined_names() -> Non
     assert set(runtime.viewports["viewport2"].branch_crops) == {"coop", "run"}
     assert set(runtime.viewports["viewport1"].branch_crops) == {"porch"}
     assert any(name.startswith("crop_coop_to_viewport2") for name in made)
+
+
+def _background_runtime(colour: str | None, *, missing: bool = False):
+    """A runtime stripped to what _build_background touches."""
+    made: list[str] = []
+    props: dict[str, object] = {}
+
+    class _El:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def get_name(self) -> str:
+            return self.name
+
+        def set_property(self, prop: str, value: object) -> None:
+            props[f"{self.name}.{prop}"] = value
+
+        def link(self, other: "_El") -> bool:
+            return True
+
+    runtime = object.__new__(WallRuntime)
+    runtime.Gst = SimpleNamespace(
+        Caps=SimpleNamespace(from_string=lambda text: text)
+    )
+    runtime.drm_fd = 0
+    runtime.displays = {
+        "main": SimpleNamespace(connector_id=35, width=1920, height=1080)
+    }
+    runtime.config = SimpleNamespace(drm=SimpleNamespace(background=colour))
+    runtime.background_sinks = {}
+
+    def _element(factory: str, name: str):
+        if missing:
+            raise RuntimeDependencyError(f"missing element: {factory}")
+        return _El(name)
+
+    runtime._element = _element
+    runtime._add = lambda *els: [made.append(e.get_name()) for e in els]
+    runtime._link_many = lambda *els: None
+    runtime._set_if_present = lambda el, prop, value: props.__setitem__(
+        f"{el.get_name()}.{prop}", value
+    )
+    return runtime, made, props
+
+
+def test_background_paints_the_configured_colour() -> None:
+    runtime, made, props = _background_runtime("#204060")
+    runtime._build_background()
+    assert set(runtime.background_sinks) == {"main"}
+    assert any(name.startswith("background_src_") for name in made)
+    # Alpha must be set or videotestsrc reads the colour as transparent.
+    assert props["background_src_main.foreground-color"] == 0xFF204060
+
+
+def test_background_uses_modesetting_rather_than_a_plane() -> None:
+    """The distinction the whole feature rests on.
+
+    A full-screen overlay plane costs about six viewports of VC4 HVS budget
+    and fails with ENOSPC beside a real wall. A modeset costs nothing. Left
+    to itself kmssink would take the first free overlay, which is a plane a
+    viewport needs, so nothing here may set plane-id either.
+    """
+    runtime, _made, props = _background_runtime("#000000")
+    runtime._build_background()
+    assert props["kms_background_main.force-modesetting"] is True
+    assert not any(key.endswith(".plane-id") for key in props)
+
+
+def test_background_source_stays_live() -> None:
+    # A single buffer would revert the moment the element left PLAYING.
+    runtime, _made, props = _background_runtime("#000000")
+    runtime._build_background()
+    assert props["background_src_main.is-live"] is True
+
+
+def test_background_none_builds_nothing() -> None:
+    runtime, made, _props = _background_runtime(None)
+    runtime._build_background()
+    assert runtime.background_sinks == {}
+    assert made == []
+
+
+def test_background_failure_does_not_stop_the_wall(caplog) -> None:
+    """A wall showing the console beats no wall at all."""
+    runtime, _made, _props = _background_runtime("#000000", missing=True)
+    with caplog.at_level(logging.WARNING):
+        runtime._build_background()
+    assert runtime.background_sinks == {}
+    assert "background unavailable" in caplog.text
 
 
 class _FakeStructure:

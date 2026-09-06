@@ -569,6 +569,90 @@ uri = "rtsp://nvr.invalid/feed"
     assert config.drm.poll_interval_seconds == 30
 
 
+def test_background_defaults_to_black(tmp_path: Path) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).drm.background == "#000000"
+
+
+@pytest.mark.parametrize(
+    ("written", "expected"),
+    [
+        ("#123456", "#123456"),
+        # Three digits expand, so the runtime only ever handles one shape.
+        ("#abc", "#AABBCC"),
+        ("#AbCdEf", "#ABCDEF"),
+        ("none", None),
+        # Disabling is a plain word, and the case it is written in is the
+        # user's business rather than something to reject.
+        ("NONE", None),
+    ],
+)
+def test_background_accepts_colours_and_none(
+    tmp_path: Path, written: str, expected: str | None
+) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        f"""
+[drm]
+background = "{written}"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).drm.background == expected
+
+
+@pytest.mark.parametrize(
+    "written",
+    ["black", "#12345", "#gggggg", "", "000000"],
+)
+def test_background_rejects_anything_else(tmp_path: Path, written: str) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        f"""
+[drm]
+background = "{written}"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="drm.background"):
+        load_config(config_path, {})
+
+
+def test_background_rejects_a_non_string(tmp_path: Path) -> None:
+    # A bare colour looks like a number to TOML, and "must be a string" says
+    # more about the fix than a failed hex match would.
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[drm]
+background = 0
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="drm.background must be a string"):
+        load_config(config_path, {})
+
+
 def test_spacing_defaults_to_zero_without_either_table(tmp_path: Path) -> None:
     config_path = tmp_path / "viewwall.toml"
     config_path.write_text(

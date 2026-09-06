@@ -52,6 +52,7 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # Fraction reads "0.33" and "1e-2" happily, and both are the imprecise
 # spelling this refuses. Also catches signs and non-ASCII digits.
 _NOT_FRACTION_RE = re.compile(r"[^0-9/]")
+_HEX_COLOUR_RE = re.compile(r"^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$")
 
 
 def parse_fraction(value: object, field: str) -> Fraction:
@@ -147,6 +148,12 @@ class DrmConfig:
 
     device: str = "/dev/dri/card0"
     poll_interval_seconds: float = 2.0
+    # What to paint underneath the viewports. Nothing draws there otherwise,
+    # so the framebuffer console shows through wherever no viewport covers:
+    # the gaps, the outer margin, and any viewport whose plane is disabled
+    # because every feed behind it is down. None leaves the console alone,
+    # which "none" in the file selects.
+    background: str | None = "#000000"
 
 
 DEFAULT_DISPLAY_NAME = "main"
@@ -285,6 +292,30 @@ def _positive_number(value: object, field: str) -> float:
     return float(value)
 
 
+def _background(value: object) -> str | None:
+    """Normalise drm.background into a colour, or None to leave the console.
+
+    The three-digit form is expanded here so the runtime only ever sees six,
+    and the result is uppercased so a log line quoting it reads the same
+    however the file was written.
+    """
+    if not isinstance(value, str):
+        raise ConfigError("drm.background must be a string")
+    text = value.strip()
+    if text.lower() == "none":
+        return None
+    match = _HEX_COLOUR_RE.match(text)
+    if match is None:
+        raise ConfigError(
+            'drm.background must be "none" or a hex colour such as "#000000", '
+            f"not {value!r}"
+        )
+    digits = match.group(1)
+    if len(digits) == 3:
+        digits = "".join(digit * 2 for digit in digits)
+    return f"#{digits.upper()}"
+
+
 def _require_table_name(name: str, field: str) -> None:
     """Reject a table key that cannot name anything.
 
@@ -318,7 +349,7 @@ def _mapping(value: object, field: str, allowed: Container[str] | None = None) -
     return value
 
 
-_DRM_KEYS = frozenset({"device", "poll_interval_seconds"})
+_DRM_KEYS = frozenset({"device", "poll_interval_seconds", "background"})
 # Settings that describe one output. [display_defaults] supplies them to every
 # display that does not say otherwise, including the discovered one.
 _DISPLAY_DEFAULT_KEYS = frozenset({"gap_px", "outer_margin_px"})
@@ -373,7 +404,11 @@ def load_config(path: str | Path, environ: Mapping[str, str] | None = None) -> A
     if not isinstance(device, str) or not device:
         raise ConfigError("drm.device must be a path")
 
-    drm = DrmConfig(device=device, poll_interval_seconds=poll_interval)
+    drm = DrmConfig(
+        device=device,
+        poll_interval_seconds=poll_interval,
+        background=_background(drm_raw.get("background", "#000000")),
+    )
 
     def _display(display_raw: dict[str, Any], field: str, name: str) -> DisplayConfig:
         width = display_raw.get("width")

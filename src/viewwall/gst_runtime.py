@@ -182,6 +182,7 @@ class WallRuntime:
         self.drm_fd = os.open(config.drm.device, os.O_RDWR | os.O_CLOEXEC)
         self.feeds: dict[str, FeedRuntime] = {}
         self.viewports: dict[str, ViewportRuntime] = {}
+        self.background_sinks: dict[str, Any] = {}
         self._feed_bins: dict[str, tuple[str, int]] = {}
         self._retired_feed_bins: dict[str, Any] = {}
         self._stopping = False
@@ -276,6 +277,7 @@ class WallRuntime:
                 raise RuntimeDependencyError(
                     f"required GStreamer element is unavailable: {factory}"
                 )
+        self._build_background()
         self._build_viewports()
         self._build_feeds()
         self._connect_feed_branches()
@@ -285,6 +287,79 @@ class WallRuntime:
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
+
+    def _build_background(self) -> None:
+        """Paint under the viewports so the console does not show through.
+
+        Only the viewport rectangles are ever drawn. Below them the primary
+        plane still holds whatever the framebuffer console left there, and it
+        shows in the gaps, in the outer margin, and across any viewport whose
+        plane has been disabled because every feed behind it is down.
+
+        This is a modeset, not another overlay plane, and the distinction is
+        the whole reason it is affordable. As an overlay a full-screen
+        background costs about six 640x360 viewports of VC4 HVS budget --
+        measured on a Pi 3: it fits alongside two viewports and fails with
+        ENOSPC at three. The cost follows plane *width* across every
+        scanline, so neither NV12 nor a smaller buffer scaled up avoids it.
+        force-modesetting hands the buffer straight to the CRTC instead,
+        which never enters plane compositing: nine viewports plus a
+        full-screen background then run at unchanged framerates.
+
+        force-modesetting is load-bearing for a second reason. Without it
+        kmssink picks the first free *overlay* rather than erroring, quietly
+        taking a plane a viewport needs.
+
+        Never fatal. A wall with a visible console is what every release so
+        far has shipped, and it beats no wall at all.
+        """
+        colour = self.config.drm.background
+        if colour is None:
+            return
+        for display_name, state in self.displays.items():
+            safe = display_name.replace("-", "_")
+            try:
+                source = self._element("videotestsrc", f"background_src_{safe}")
+                filt = self._element("capsfilter", f"background_caps_{safe}")
+                sink = self._element("kmssink", f"kms_background_{safe}")
+            except RuntimeDependencyError as exc:
+                LOG.warning(
+                    "display %s: background unavailable: %s", display_name, exc
+                )
+                continue
+            sink.set_property("fd", os.dup(self.drm_fd))
+            sink.set_property("connector-id", state.connector_id)
+            self._set_if_present(sink, "force-modesetting", True)
+            # The CRTC goes back to the console's framebuffer when the DRM fd
+            # closes, so the console returns on exit either way, including
+            # after a kill -9. This only stops kmssink restoring the mode
+            # itself, which it has no reason to do here.
+            self._set_if_present(sink, "restore-crtc", False)
+            self._set_if_present(sink, "skip-vsync", True)
+            self._set_if_present(sink, "qos", False)
+            # One still frame, so there is nothing to synchronise against and
+            # no reason to hold the pipeline in ASYNC_PENDING waiting for it.
+            sink.set_property("async", False)
+            sink.set_property("sync", False)
+            source.set_property("pattern", "solid-color")
+            # A single buffer would not hold: the CRTC reverts as soon as the
+            # element leaves PLAYING. The source stays live at a low rate
+            # instead, which costs nothing once the frame is on screen.
+            source.set_property("is-live", True)
+            # videotestsrc takes 0xAARRGGBB and reads a zero alpha byte as
+            # fully transparent, so the colour has to carry one.
+            source.set_property("foreground-color", 0xFF000000 | int(colour[1:], 16))
+            filt.set_property(
+                "caps",
+                self.Gst.Caps.from_string(
+                    f"video/x-raw,width={state.width},"
+                    f"height={state.height},framerate=1/2"
+                ),
+            )
+            self._add(source, filt, sink)
+            self._link_many(source, filt, sink)
+            self.background_sinks[display_name] = sink
+            LOG.info("display %s: background %s", display_name, colour)
 
     def _build_viewports(self) -> None:
         next_plane = {name: 0 for name in self.displays}

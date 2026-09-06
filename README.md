@@ -201,6 +201,7 @@ one output and a plane handed to one display is not available to the other.
 |---|---|---|
 | `device` | `"/dev/dri/card0"` | DRM card to open. Displays are connectors within one card, not separate devices. |
 | `poll_interval_seconds` | `2` | How often to re-probe the card for a resolution change. One probe reports every connector. |
+| `background` | `"#000000"` | Color painted under the viewports as `#RRGGBB` or `"none"` to leave the framebuffer console showing in the background. |
 
 ### Metrics
 

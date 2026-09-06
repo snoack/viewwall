@@ -159,6 +159,43 @@ Judge stability by whether `NRestarts` stays flat, not by a single `kmsprint`:
 a wall that exceeds the scaler budget reaches all nine planes and then dies, so
 a point-in-time check can look healthy moments before a failure.
 
+### Background
+
+Only the viewport rectangles are ever drawn. Below them the primary plane still
+holds the framebuffer console, which shows through the gaps, the outer margin,
+and any viewport whose plane is disabled because every feed behind it is down.
+`drm.background` paints over it.
+
+It is a **modeset**, not another plane, and that is the only reason it fits.
+Measured on a Pi 3 at 1920x1080:
+
+| Background as | Result |
+|---|---|
+| Overlay plane, full-screen 1:1 | ENOSPC beside 3 viewports; works only with 2 |
+| Overlay plane, 640x360 scaled up | ENOSPC beside 5 viewports |
+| Overlay plane, 640x360 rendered 1:1 | Fits beside 5 viewports |
+| Modeset (`force-modesetting=true`) | Fits beside all nine, framerates unchanged |
+
+A full-screen overlay costs roughly six 640x360 viewports of HVS budget. The
+cost follows plane **width** across every scanline, so no pixel format or
+buffer size avoids it -- the 640x360 rows above differ only in whether the HVS
+must scale, and the full-screen 1:1 row shows size alone is enough to fail.
+`force-modesetting` hands the buffer to the CRTC instead, which never enters
+plane compositing at all. While it runs, `kmsprint -l` shows the primary with
+no `fb-id`.
+
+`force-modesetting` is load-bearing for a second reason: without it kmssink
+picks the first free **overlay** rather than erroring, quietly taking a plane a
+viewport needs.
+
+The console returns on exit, including after `kill -9`: the kernel restores the
+CRTC when the DRM fd closes. `restore-crtc=false` only stops kmssink restoring
+the mode itself.
+
+A viewport with no healthy feed now shows the background rather than the
+console, so a dark tile and a camera pointed at a dark room look alike. Setting
+`background` to something other than black distinguishes them.
+
 ### Seams
 
 ```toml
