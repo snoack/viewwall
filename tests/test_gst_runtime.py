@@ -567,6 +567,58 @@ def test_background_failure_does_not_stop_the_wall(caplog) -> None:
     assert "background unavailable" in caplog.text
 
 
+def _stats_sink(rendered: int, dropped: int = 0):
+    stats = SimpleNamespace(
+        get_value=lambda key: {"rendered": rendered, "dropped": dropped}[key]
+    )
+    return SimpleNamespace(get_property=lambda prop: stats if prop == "stats" else None)
+
+
+def test_presented_fps_is_the_delta_between_reports() -> None:
+    """kmssink reports totals, so a rate needs the previous reading."""
+    runtime = object.__new__(WallRuntime)
+    assert runtime._sink_presented(_stats_sink(120, 3)) == (120, 3)
+
+
+def test_presented_fps_survives_a_sink_without_stats() -> None:
+    # Not every build carries the property, and a missing counter must not
+    # take down the report that carries every other field.
+    runtime = object.__new__(WallRuntime)
+    assert runtime._sink_presented(None) is None
+    assert runtime._sink_presented(SimpleNamespace()) is None
+    assert (
+        runtime._sink_presented(SimpleNamespace(get_property=lambda p: None)) is None
+    )
+
+
+def test_presented_fps_reported_next_to_rendered(caplog, monkeypatch) -> None:
+    runtime = _metrics_runtime()
+    viewport = runtime.viewports["upper_left"]
+    # 60 rendered but only 12 presented: the plane path is the bottleneck,
+    # which is the whole reason the field exists.
+    viewport.sink = _stats_sink(12)
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
+    with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
+        runtime._report_metrics()
+    assert "presented_fps=6.0" in caplog.text
+    assert viewport.presented_total == 12
+
+
+def test_presented_fps_restarts_with_a_replaced_sink(caplog, monkeypatch) -> None:
+    """A replaced sink counts from zero, which is not a counter wrap."""
+    runtime = _metrics_runtime()
+    viewport = runtime.viewports["upper_left"]
+    viewport.presented_total = 500
+    viewport.sink = _stats_sink(4)
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
+    with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
+        runtime._report_metrics()
+    # No rate this interval rather than a negative one, and the baseline
+    # follows the new sink so the next interval reads correctly.
+    assert "presented_fps=" not in caplog.text
+    assert viewport.presented_total == 4
+
+
 class _FakeStructure:
     def __init__(self, fields: dict[str, str]) -> None:
         self._fields = fields
@@ -806,9 +858,12 @@ def _metrics_runtime(queue_ns: int | None = 45_000_000) -> WallRuntime:
             active_index=0,
             active_feed="porch",
             output_queue=queue if queue_ns is not None else None,
-            rendered_frames=60,
+            queued_frames=60,
             metrics_since=None,
             metrics_rotated=False,
+            sink=None,
+            presented_total=0,
+            dropped_total=0,
         )
     }
     runtime.feeds = {
@@ -826,7 +881,7 @@ def test_metrics_report_rates_over_the_elapsed_interval(
         assert runtime._report_metrics() is True
     record = caplog.records[-1]
     # 60 buffers over 2s, so 30fps; the fields carry numbers, not prose.
-    assert record.VW_FPS == "30.0"
+    assert record.VW_QUEUED_FPS == "30.0"
     assert record.VW_DECODED_FPS == "30.5"
     assert record.VW_QUEUE_MS == "45"
     assert record.VW_VIEWPORT == 1
@@ -839,7 +894,7 @@ def test_metrics_counters_reset_each_interval(monkeypatch: pytest.MonkeyPatch) -
     runtime = _metrics_runtime()
     monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
     runtime._report_metrics()
-    assert runtime.viewports["upper_left"].rendered_frames == 0
+    assert runtime.viewports["upper_left"].queued_frames == 0
     assert runtime.feeds["porch"].decoded_frames == 0
 
 
@@ -872,7 +927,7 @@ def test_a_primed_viewport_reports_its_feed(
         runtime._report_metrics()
     record = caplog.records[-1]
     assert record.VW_FEED == "porch"
-    assert record.VW_FPS == "30.0"
+    assert record.VW_QUEUED_FPS == "30.0"
 
 
 def test_a_feed_in_two_viewports_reports_in_both(
@@ -886,9 +941,12 @@ def test_a_feed_in_two_viewports_reports_in_both(
         active_index=0,
         active_feed="porch",
         output_queue=None,
-        rendered_frames=30,
+        queued_frames=30,
         metrics_since=None,
         metrics_rotated=False,
+        sink=None,
+        presented_total=0,
+        dropped_total=0,
     )
     monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
     with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
@@ -905,13 +963,13 @@ def test_a_viewport_measures_only_since_its_last_feed_switch(
     # from that moment, so the rate describes the feed actually selected.
     runtime = _metrics_runtime()
     viewport = runtime.viewports["upper_left"]
-    viewport.rendered_frames = 45
+    viewport.queued_frames = 45
     viewport.metrics_since = 0.5
     monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
     with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
         runtime._report_metrics()
     # 45 frames in the 1.5s since the switch, not over the 2s interval.
-    assert caplog.records[-1].VW_FPS == "30.0"
+    assert caplog.records[-1].VW_QUEUED_FPS == "30.0"
 
 
 def test_a_rotated_viewport_is_flagged_as_not_comparable(
@@ -996,13 +1054,13 @@ def test_an_unmeasurably_short_window_reports_no_rate(
     # "fps=416.5 window_s=0.0": one stray buffer divided by almost no time.
     runtime = _metrics_runtime()
     viewport = runtime.viewports["upper_left"]
-    viewport.rendered_frames = 1
+    viewport.queued_frames = 1
     viewport.metrics_since = 1.998
     monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
     with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
         runtime._report_metrics()
     record = caplog.records[-1]
-    assert record.VW_FPS == "-"
+    assert record.VW_QUEUED_FPS == "-"
     # The raw count still shows the viewport is alive.
     assert record.VW_FRAMES == "1"
 
@@ -1020,7 +1078,7 @@ def test_a_full_window_reports_no_frame_count(
 def _dark_runtime(monkeypatch: pytest.MonkeyPatch) -> tuple[WallRuntime, list[str]]:
     sent: list[str] = []
     runtime = _metrics_runtime()
-    runtime.viewports["upper_left"].rendered_frames = 0
+    runtime.viewports["upper_left"].queued_frames = 0
     monkeypatch.setattr(
         WallRuntime, "_notify_systemd", staticmethod(lambda m: sent.append(m) or True)
     )
@@ -1054,7 +1112,7 @@ def test_recovery_is_reported(
 ) -> None:
     runtime, sent = _dark_runtime(monkeypatch)
     runtime._report_metrics()
-    runtime.viewports["upper_left"].rendered_frames = 60
+    runtime.viewports["upper_left"].queued_frames = 60
     runtime._metrics_sampled_at = 0.0
     with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
         runtime._report_metrics()
@@ -1065,7 +1123,7 @@ def test_recovery_is_reported(
 
 def test_a_healthy_wall_reports_nothing_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime, sent = _dark_runtime(monkeypatch)
-    runtime.viewports["upper_left"].rendered_frames = 60
+    runtime.viewports["upper_left"].queued_frames = 60
     runtime._report_metrics()
     assert sent == []
 

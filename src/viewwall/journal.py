@@ -5,7 +5,7 @@ sentence and recovering it later with a regex means the parser breaks whenever
 someone rewords the message. The journal accepts arbitrary fields alongside the
 message, so the numbers can stay numbers:
 
-    journalctl -u viewwall -o json --output-fields=VW_FEED,VW_FPS,VW_QUEUE_MS
+    journalctl -u viewwall -o json --output-fields=VW_FEED,VW_QUEUED_FPS,VW_PRESENTED_FPS
 
 python3-systemd would provide this, but it would also be viewwall's first
 runtime Python dependency, and the native protocol is a datagram on a well

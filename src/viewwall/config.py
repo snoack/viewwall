@@ -179,7 +179,7 @@ class DisplayConfig:
 
 @dataclass(frozen=True)
 class MetricsConfig:
-    """Periodic reporting of rendered framerate and queue occupancy.
+    """Periodic reporting of queued and presented framerates.
 
     On by default: instrumentation that has to be switched on before a problem
     can be reproduced is instrumentation you do not have when it matters.

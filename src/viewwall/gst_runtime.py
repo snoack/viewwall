@@ -113,9 +113,13 @@ class ViewportRuntime:
     resolved: ResolvedViewport | None = None
     crop_values: SourceCrop | None = None
     pixel_aspect_ratio: Fraction | None = None
-    rendered_frames: int = 0
+    queued_frames: int = 0
     metrics_since: float | None = None
     metrics_rotated: bool = False
+    # Cumulative sink counters, not per-interval: kmssink reports totals, so
+    # the interval rate is the difference against what was read last time.
+    presented_total: int = 0
+    dropped_total: int = 0
 
 
 class WallRuntime:
@@ -1133,7 +1137,7 @@ class WallRuntime:
         # Frames counted before the switch came from the previous feed. Left
         # in place they would be averaged with the new one's, and a viewport
         # rotating a 3fps and a 24fps camera would report a meaningless ~13.
-        viewport.rendered_frames = 0
+        viewport.queued_frames = 0
         viewport.metrics_since = time.monotonic()
         viewport.metrics_rotated = True
         LOG.info(
@@ -1673,7 +1677,7 @@ class WallRuntime:
     def _on_viewport_buffer(self, pad: Any, info: Any, viewport_name: str) -> Any:
         viewport = self.viewports.get(viewport_name)
         if viewport is not None:
-            viewport.rendered_frames += 1
+            viewport.queued_frames += 1
         return self.Gst.PadProbeReturn.OK
 
     def _queue_delay_ms(self, queue: Any) -> float | None:
@@ -1690,6 +1694,31 @@ class WallRuntime:
             return None
         return level_ns / 1_000_000.0
 
+    def _sink_presented(self, sink: Any) -> tuple[int, int] | None:
+        """Frames the sink has put on screen, and frames it threw away.
+
+        queued_frames counts buffers leaving the output queue, which is one
+        step short: a buffer the sink drops has still left the queue. These
+        are basesink's own totals, taken after that decision, and so are the
+        closest thing available to what actually reached the panel.
+
+        Note that basesink's "rendered" means frames it put on the plane,
+        which is what this module calls presented. The queue-side count is
+        named queued throughout to keep the two apart.
+        """
+        if sink is None:
+            return None
+        try:
+            stats = sink.get_property("stats")
+        except (TypeError, AttributeError):
+            return None
+        if stats is None:
+            return None
+        try:
+            return int(stats.get_value("rendered")), int(stats.get_value("dropped"))
+        except (TypeError, AttributeError, ValueError):
+            return None
+
     def _start_metrics(self) -> None:
         if not self.config.metrics.enabled:
             return
@@ -1698,7 +1727,7 @@ class WallRuntime:
         self.GLib.timeout_add(interval_ms, self._report_metrics)
 
     def _report_metrics(self) -> bool:
-        """Log rendered framerate and queue occupancy for every viewport.
+        """Log queued and presented framerates, and queue occupancy.
 
         Emitted every interval whether or not anything looks wrong, because the
         useful question is retrospective: was the wall dropping frames an hour
@@ -1723,8 +1752,8 @@ class WallRuntime:
             feed.decoded_frames = 0
 
         for viewport in self.viewports.values():
-            rendered = viewport.rendered_frames
-            viewport.rendered_frames = 0
+            queued = viewport.queued_frames
+            viewport.queued_frames = 0
             # A viewport that switched feeds mid-interval has been counting for
             # less than the full interval, so divide by its own window.
             window = elapsed
@@ -1747,24 +1776,46 @@ class WallRuntime:
             feed_name = viewport.config.feeds[viewport.active_index]
             feed = self.feeds.get(feed_name)
             queue_ms = self._queue_delay_ms(viewport.output_queue)
+            # Presented rate, which is not the same as the queued rate above
+            # and is the one the eye sees. Each kmssink issues its own
+            # drmModeSetPlane and the VC4 retires one per vblank, so nine
+            # planes share 60 updates a second however fast the decoders run.
+            # Reported next to fps so the two can be compared directly: a wide
+            # gap is the plane path, not the network or the decoder.
+            presented = self._sink_presented(viewport.sink)
+            presented_fps: float | None = None
+            dropped_delta: int | None = None
+            if presented is not None:
+                total, dropped = presented
+                # A replaced sink starts its counters again, so a total below
+                # what was seen last time is a new sink rather than a wrap.
+                if total >= viewport.presented_total:
+                    presented_fps = (total - viewport.presented_total) / window
+                    dropped_delta = dropped - viewport.dropped_total
+                viewport.presented_total = total
+                viewport.dropped_total = dropped
             fields = {
                 "VW_VIEWPORT": viewport.config.index,
                 "VW_FEED": feed_name,
                 "VW_STATE": feed.state if feed is not None else "none",
-                "VW_FPS": f"{rendered / window:.1f}" if measurable else "-",
+                "VW_QUEUED_FPS": f"{queued / window:.1f}" if measurable else "-",
                 "VW_DECODED_FPS": f"{decoded_rates.get(feed_name, 0.0):.1f}",
                 "VW_WINDOW_S": f"{window:.1f}",
             }
+            if presented_fps is not None and measurable:
+                fields["VW_PRESENTED_FPS"] = f"{presented_fps:.1f}"
+            if dropped_delta:
+                fields["VW_SINK_DROPPED"] = str(dropped_delta)
             if not measurable:
                 # So the dash is not read as a dead viewport.
-                fields["VW_FRAMES"] = str(rendered)
+                fields["VW_FRAMES"] = str(queued)
             if rotated:
                 # Names why, so the line is not read as dropped frames.
                 fields["VW_ROTATED"] = "1"
             if queue_ms is not None:
                 fields["VW_QUEUE_MS"] = f"{queue_ms:.0f}"
             LOG.info("metrics %s", format_fields(fields), extra=fields)
-            if rendered:
+            if queued:
                 showing += 1
         self._report_wall_health(showing)
         return True

@@ -205,27 +205,42 @@ one output and a plane handed to one display is not available to the other.
 
 ### Metrics
 
-Every 60 seconds viewwall logs what each viewport is actually rendering:
+Every 60 seconds viewwall logs what each viewport is doing:
 
 ```text
-metrics viewport=2 feed=porch state=healthy fps=29.6 decoded_fps=29.8 window_s=60.0 queue_ms=45
+metrics viewport=2 feed=porch state=healthy queued_fps=29.6 decoded_fps=29.8 \
+  window_s=60.0 presented_fps=7.4 sink_dropped=1327 queue_ms=45
 ```
 
-`fps` is what reached the screen, `decoded_fps` what the decoder produced, and
-`queue_ms` how much video is waiting — a viewport sitting at 250ms is a quarter of
-a second behind live. A gap between `decoded_fps` and `fps` means frames are
-being dropped at the display end.
+The three rates follow one frame along the path, and a drop between any two
+names where it is being lost:
+
+| Field | Where it is counted |
+|---|---|
+| `decoded_fps` | Frames leaving the decoder. |
+| `queued_fps` | Buffers leaving the viewport's output queue toward its plane. A gap below `decoded_fps` is the leaky queue shedding frames the wall could not keep up with. |
+| `presented_fps` | Buffers the sink actually put on the KMS plane. This is what reaches the screen. |
+| `sink_dropped` | Buffers the sink discarded for arriving late against the clock, which is the difference between the two rates above. |
+
+Expect `presented_fps` to sit well below `queued_fps` on a full wall. Each
+plane is updated by its own `drmModeSetPlane` and the VC4 retires one per
+vblank, so the viewports share 60 updates a second between them: a nine-viewport
+wall measures about 7.4fps each, summing to 60. See the plane budget section of
+DESIGN.md.
+
+`queue_ms` is how much video is waiting — a viewport sitting at 250ms is a
+quarter of a second behind live.
 
 A rotating viewport that switched feeds during the interval is marked `rotated=1`,
-with `window_s` giving the shorter span `fps` covers. Its `fps` and
+with `window_s` giving the shorter span the rates cover. Its rates and
 `decoded_fps` are measured over different spans and should not be compared.
 
 Under systemd these are attached as structured journal fields, so they can be
 summarized without parsing the text:
 
 ```sh
-journalctl -u viewwall -o json --output-fields=VW_VIEWPORT,VW_FPS,VW_QUEUE_MS \
-  | jq -r 'select(.VW_VIEWPORT) | [.VW_VIEWPORT, .VW_FPS, .VW_QUEUE_MS] | @tsv'
+journalctl -u viewwall -o json --output-fields=VW_VIEWPORT,VW_QUEUED_FPS,VW_PRESENTED_FPS \
+  | jq -r 'select(.VW_VIEWPORT) | [.VW_VIEWPORT, .VW_QUEUED_FPS, .VW_PRESENTED_FPS] | @tsv'
 ```
 
 To change the interval, or turn it off:
