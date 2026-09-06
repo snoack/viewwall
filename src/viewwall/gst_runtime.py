@@ -120,6 +120,12 @@ class ViewportRuntime:
     # the interval rate is the difference against what was read last time.
     presented_total: int = 0
     dropped_total: int = 0
+    # Summed lateness of the interval's buffers, in milliseconds, and how many
+    # contributed. A mean is kept rather than each sample because the answer
+    # wanted is one number per viewport per interval.
+    lateness_ms_total: float = 0.0
+    lateness_samples: int = 0
+    lateness_ms_max: float = 0.0
 
 
 class WallRuntime:
@@ -1678,7 +1684,49 @@ class WallRuntime:
         viewport = self.viewports.get(viewport_name)
         if viewport is not None:
             viewport.queued_frames += 1
+            self._observe_lateness(viewport, info)
         return self.Gst.PadProbeReturn.OK
+
+    def _observe_lateness(self, viewport: ViewportRuntime, info: Any) -> None:
+        """How far past its presentation time a buffer reaches the sink.
+
+        The sink drops a buffer whose running time is already behind the
+        clock by more than max-lateness, which basesink defaults to 5ms.
+        Measuring the actual figure separates the two explanations for a
+        viewport presenting far below its queued rate: buffers timestamped
+        wrongly arrive hundreds of milliseconds late from the first frame,
+        while buffers merely waiting their turn for one of the CRTC's 60
+        commit slots a second are late by something near that interval.
+
+        Sampled on the queue's source pad, which is the last point before the
+        sink and the only probe already attached. Nothing here may fail a
+        buffer: a viewport whose clock is not yet running simply records
+        nothing this interval.
+        """
+        element = viewport.sink
+        if element is None:
+            return
+        buffer = info.get_buffer()
+        if buffer is None or buffer.pts == self.Gst.CLOCK_TIME_NONE:
+            return
+        clock = element.get_clock()
+        if clock is None:
+            return
+        base_time = element.get_base_time()
+        if base_time == self.Gst.CLOCK_TIME_NONE:
+            return
+        now = clock.get_time()
+        if now == self.Gst.CLOCK_TIME_NONE or now < base_time:
+            return
+        # Running time, the same conversion basesink makes before comparing
+        # against the clock. Segment offsets are not applied: the pipeline
+        # runs a plain live segment per feed, so pts is already running time.
+        late_ns = (now - base_time) - buffer.pts
+        late_ms = late_ns / 1_000_000.0
+        viewport.lateness_ms_total += late_ms
+        viewport.lateness_samples += 1
+        if late_ms > viewport.lateness_ms_max:
+            viewport.lateness_ms_max = late_ms
 
     def _queue_delay_ms(self, queue: Any) -> float | None:
         """How much video is waiting in a queue, in milliseconds.
@@ -1782,6 +1830,13 @@ class WallRuntime:
             # planes share 60 updates a second however fast the decoders run.
             # Reported next to fps so the two can be compared directly: a wide
             # gap is the plane path, not the network or the decoder.
+            late_mean: float | None = None
+            late_max = viewport.lateness_ms_max
+            if viewport.lateness_samples:
+                late_mean = viewport.lateness_ms_total / viewport.lateness_samples
+            viewport.lateness_ms_total = 0.0
+            viewport.lateness_samples = 0
+            viewport.lateness_ms_max = 0.0
             presented = self._sink_presented(viewport.sink)
             presented_fps: float | None = None
             dropped_delta: int | None = None
@@ -1806,6 +1861,12 @@ class WallRuntime:
                 fields["VW_PRESENTED_FPS"] = f"{presented_fps:.1f}"
             if dropped_delta:
                 fields["VW_SINK_DROPPED"] = str(dropped_delta)
+            # Only when frames are being lost. On a viewport presenting what
+            # it queues these two say nothing, and every metrics line is nine
+            # lines of journal a minute already.
+            if late_mean is not None and dropped_delta:
+                fields["VW_LATE_MS"] = f"{late_mean:.0f}"
+                fields["VW_LATE_MS_MAX"] = f"{late_max:.0f}"
             if not measurable:
                 # So the dash is not read as a dead viewport.
                 fields["VW_FRAMES"] = str(queued)
