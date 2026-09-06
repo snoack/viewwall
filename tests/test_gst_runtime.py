@@ -619,136 +619,6 @@ def test_presented_fps_restarts_with_a_replaced_sink(caplog, monkeypatch) -> Non
     assert viewport.presented_total == 4
 
 
-def _lateness_runtime(pts_ns: int, now_ns: int, base_ns: int):
-    runtime = object.__new__(WallRuntime)
-    runtime.Gst = SimpleNamespace(CLOCK_TIME_NONE=2**64 - 1)
-    clock = SimpleNamespace(get_time=lambda: now_ns)
-    sink = SimpleNamespace(
-        get_clock=lambda: clock, get_base_time=lambda: base_ns
-    )
-    viewport = SimpleNamespace(
-        sink=sink,
-        lateness_ms_total=0.0,
-        lateness_samples=0,
-        lateness_ms_max=0.0,
-        # 1, so the very next buffer is the sampled one.
-        lateness_countdown=1,
-        lateness_clock=None,
-        lateness_base=0,
-    )
-    info = SimpleNamespace(get_buffer=lambda: SimpleNamespace(pts=pts_ns))
-    return runtime, viewport, info
-
-
-def test_lateness_is_running_time_minus_buffer_time() -> None:
-    # Clock 500ms past base, buffer stamped for 300ms: 200ms late.
-    runtime, viewport, info = _lateness_runtime(
-        pts_ns=300_000_000, now_ns=1_500_000_000, base_ns=1_000_000_000
-    )
-    runtime._observe_lateness(viewport, info)
-    assert viewport.lateness_samples == 1
-    assert viewport.lateness_ms_total == pytest.approx(200.0)
-    assert viewport.lateness_ms_max == pytest.approx(200.0)
-
-
-def test_lateness_keeps_the_worst_of_the_interval() -> None:
-    runtime, viewport, info = _lateness_runtime(
-        pts_ns=300_000_000, now_ns=1_500_000_000, base_ns=1_000_000_000
-    )
-    runtime._observe_lateness(viewport, info)
-    later = SimpleNamespace(get_buffer=lambda: SimpleNamespace(pts=400_000_000))
-    viewport.lateness_countdown = 1
-    runtime._observe_lateness(viewport, later)
-    assert viewport.lateness_samples == 2
-    # The second buffer is only 100ms late, so the maximum stands.
-    assert viewport.lateness_ms_max == pytest.approx(200.0)
-
-
-@pytest.mark.parametrize(
-    ("pts", "now", "base"),
-    [
-        # No timestamp to compare against.
-        (2**64 - 1, 1_500_000_000, 1_000_000_000),
-        # A clock that has not started yet reads before base time.
-        (300_000_000, 500_000_000, 1_000_000_000),
-    ],
-)
-def test_lateness_records_nothing_it_cannot_measure(pts, now, base) -> None:
-    """A buffer must never be failed by the measurement on it."""
-    runtime, viewport, info = _lateness_runtime(pts_ns=pts, now_ns=now, base_ns=base)
-    runtime._observe_lateness(viewport, info)
-    assert viewport.lateness_samples == 0
-
-
-def test_lateness_survives_a_viewport_without_a_clock() -> None:
-    runtime, viewport, info = _lateness_runtime(
-        pts_ns=300_000_000, now_ns=1_500_000_000, base_ns=1_000_000_000
-    )
-    viewport.sink = SimpleNamespace(get_clock=lambda: None, get_base_time=lambda: 0)
-    viewport.lateness_countdown = 1
-    runtime._observe_lateness(viewport, info)
-    assert viewport.lateness_samples == 0
-    viewport.sink = None
-    viewport.lateness_countdown = 1
-    runtime._observe_lateness(viewport, info)
-    assert viewport.lateness_samples == 0
-
-
-def test_lateness_samples_rather_than_measures_every_buffer() -> None:
-    """Measuring every buffer cost ten points of a Pi 3 core.
-
-    Each PyGObject call from the probe costs microseconds and this runs on
-    every buffer of every viewport, so only one in LATENESS_SAMPLE_EVERY
-    carries the measurement.
-    """
-    runtime, viewport, info = _lateness_runtime(
-        pts_ns=300_000_000, now_ns=1_500_000_000, base_ns=1_000_000_000
-    )
-    for _ in range(WallRuntime.LATENESS_SAMPLE_EVERY * 3):
-        runtime._observe_lateness(viewport, info)
-    assert viewport.lateness_samples == 3
-
-
-def test_lateness_clock_is_read_once_per_sink() -> None:
-    """The clock and base time are fixed for a sink's lifetime."""
-    calls = []
-    runtime, viewport, info = _lateness_runtime(
-        pts_ns=300_000_000, now_ns=1_500_000_000, base_ns=1_000_000_000
-    )
-    clock = viewport.sink.get_clock()
-
-    def _counted_clock():
-        calls.append(1)
-        return clock
-
-    viewport.sink = SimpleNamespace(
-        get_clock=_counted_clock, get_base_time=lambda: 1_000_000_000
-    )
-    for _ in range(WallRuntime.LATENESS_SAMPLE_EVERY * 4):
-        runtime._observe_lateness(viewport, info)
-    assert viewport.lateness_samples == 4
-    assert len(calls) == 1
-
-
-def test_lateness_reported_only_when_frames_are_lost(caplog, monkeypatch) -> None:
-    """Nine viewports a minute; a healthy one has nothing to say here."""
-    runtime = _metrics_runtime()
-    viewport = runtime.viewports["upper_left"]
-    viewport.lateness_ms_total = 1200.0
-    viewport.lateness_samples = 10
-    viewport.lateness_ms_max = 400.0
-    # Non-zero dropped: the fields are gated on frames actually being lost.
-    viewport.sink = _stats_sink(12, dropped=48)
-    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
-    with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
-        runtime._report_metrics()
-    assert "late_ms=120" in caplog.text
-    assert "late_ms_max=400" in caplog.text
-    # Counters reset, so the next interval measures only its own buffers.
-    assert viewport.lateness_samples == 0
-    assert viewport.lateness_ms_max == 0.0
-
-
 class _FakeStructure:
     def __init__(self, fields: dict[str, str]) -> None:
         self._fields = fields
@@ -994,12 +864,6 @@ def _metrics_runtime(queue_ns: int | None = 45_000_000) -> WallRuntime:
             sink=None,
             presented_total=0,
             dropped_total=0,
-            lateness_ms_total=0.0,
-            lateness_samples=0,
-            lateness_ms_max=0.0,
-            lateness_countdown=1,
-            lateness_clock=None,
-            lateness_base=0,
         )
     }
     runtime.feeds = {
@@ -1083,12 +947,6 @@ def test_a_feed_in_two_viewports_reports_in_both(
         sink=None,
         presented_total=0,
         dropped_total=0,
-        lateness_ms_total=0.0,
-        lateness_samples=0,
-        lateness_ms_max=0.0,
-        lateness_countdown=1,
-        lateness_clock=None,
-        lateness_base=0,
     )
     monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 2.0)
     with caplog.at_level("INFO", logger="viewwall.gst_runtime"):

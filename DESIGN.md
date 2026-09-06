@@ -196,6 +196,34 @@ A viewport with no healthy feed now shows the background rather than the
 console, so a dark tile and a camera pointed at a dark room look alike. Setting
 `background` to something other than black distinguishes them.
 
+### Why there is no lateness metric
+
+A viewport losing frames could be losing them two ways: buffers timestamped
+wrongly arrive far behind the clock, or buffers merely waiting their turn for
+one of the CRTC's 60 commit slots a second are late by something near that
+interval. basesink drops both past `max-lateness`, which defaults to 5ms.
+
+Instrumenting this was tried and removed. Two findings came out of it.
+
+**It is expensive.** Measuring every buffer cost ten percentage points of a Pi
+3 core, 88.6% to 98.8%, on a wall already CPU bound. Not the arithmetic but
+the crossings into C around it: `get_buffer`, `get_clock`, `get_base_time` and
+reading `buffer.pts` are each PyGObject round trips costing microseconds, and
+a probe on every buffer of every viewport runs ~230 times a second. Sampling
+one buffer in sixteen recovered six of the ten points; the rest was the
+sampling counter itself, a Python call on every buffer whatever it decides.
+
+**It does not discriminate.** Over 27 intervals on a viewport that alternated
+between 1fps and 7fps, mean lateness was 114ms while sick and 79ms while
+healthy, but the ranges overlap: 79-254 against 73-83. A single interval
+cannot be judged from it. `queue_ms` separates the same intervals far better,
+73ms against 805ms, and costs one property read per viewport per minute.
+
+The finding that survives is a negative one: a viewport recovered from 1.9fps
+to 7.0fps while its mean lateness stayed at 89ms, so whatever such a viewport
+is doing, it is not waiting on late buffers. What it is doing instead did not
+come from this metric.
+
 ### Seams
 
 ```toml
