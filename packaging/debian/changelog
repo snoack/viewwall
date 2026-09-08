@@ -1,3 +1,22 @@
+viewwall (0.1.3-1) unstable; urgency=medium
+
+  * Restart the wall when a feed stays wedged. A feed that connects, reports
+    healthy and dies within seconds survives the branch rebuild viewwall
+    already had for it; that case now fails the whole wall so the service
+    manager gives it a clean process, instead of leaving one viewport black
+    indefinitely. A camera that is merely off cannot trigger this: only a
+    feed that reached healthy counts towards it.
+  * Never give up on that restart, and spread repeated ones from five seconds
+    out to a minute (systemd 254 or newer; older releases retry at a flat five
+    seconds). A wall that keeps restarting still shows every healthy camera in
+    between, where a stopped one shows nothing.
+  * Reload the systemd unit on upgrade. The generated postinst appended its
+    daemon-reload after the script's "exit 0", so it never ran and an upgrade
+    kept the previously installed unit file. Upgrades from 0.1.2 and earlier
+    need one "systemctl daemon-reload" by hand to pick this release up.
+
+ -- Sebastian Noack <sebastian.noack@gmail.com>  Mon, 07 Sep 2026 19:09:56 -0400
+
 viewwall (0.1.2-1) unstable; urgency=medium
 
   * Paint under the viewports so the framebuffer console no longer shows
