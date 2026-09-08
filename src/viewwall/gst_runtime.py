@@ -84,7 +84,6 @@ class FeedRuntime:
     healthy_at: float | None = None
     short_lived_generations: int = 0
     branches_rebuilt: bool = False
-    rebuilt_at_generation: int | None = None
     observed_fps_applied: bool = False
     caps_fps_known: bool = False
     watchdog_reported: bool = False
@@ -736,6 +735,10 @@ class WallRuntime:
         # tee pad it is fed from, and a source still running into a tee with
         # no branches left errors out with "not-linked" on the spot.
         self._note_generation_lifetime(feed)
+        if self._stopping:
+            # The wedge escalated to a restart; the wall is on its way down and
+            # a retry scheduled now would outlive the pipeline it targets.
+            return False
         self._schedule_feed_retry(feed)
         return False
 
@@ -753,8 +756,14 @@ class WallRuntime:
         feed that dies this fast every time got its stream and could not keep
         it, which on this wall has meant the pipeline downstream of the feed
         bin -- preserved across restarts, and never flushed -- holding state
-        from the generation before. Retrying cannot clear that, so the wall
-        will sit in this loop indefinitely while the rest of it runs normally.
+        from the generation before. Retrying cannot clear that, so a feed that
+        keeps this up past a branch rebuild takes the whole wall down and lets
+        the service manager start it again.
+
+        Only a generation that reached healthy counts. A camera that is off,
+        or behind a switch that is, never gets there, so an outage of any
+        length cannot walk a feed into the restart: it fails without ever
+        reaching the healthy line this measures from.
         """
         healthy_at = feed.healthy_at
         if healthy_at is None:
@@ -764,46 +773,46 @@ class WallRuntime:
             return
         lifetime = time.monotonic() - healthy_at
         if lifetime > self.SHORT_GENERATION_SECONDS:
-            if feed.branches_rebuilt:
-                LOG.warning(
-                    "feed %s: ran %.0fs after its branch was rebuilt, so the "
-                    "rebuild cleared the wedge",
-                    feed.config.name,
-                    lifetime,
-                )
-                feed.branches_rebuilt = False
-                feed.rebuilt_at_generation = None
+            # Long enough not to count against the feed, but not the same as
+            # recovered: _mark_feed_stable() clears the rebuild flag, on the
+            # same FEED_STABLE_SECONDS the retry backoff already treats as
+            # proof a feed is healthy. Calling it here instead would let a feed
+            # limping at sixteen second intervals reset the ladder every time
+            # and never escalate at all.
             feed.short_lived_generations = 0
             return
         feed.short_lived_generations += 1
-        if feed.short_lived_generations < self.SHORT_GENERATION_LIMIT:
+        limit = 1 if feed.branches_rebuilt else self.SHORT_GENERATION_LIMIT
+        if feed.short_lived_generations < limit:
             return
-        LOG.error(
-            "feed %s: connected and died within %.1fs on %d consecutive "
-            "attempts; the stream reaches the wall but no video follows it. "
-            "Retrying alone does not clear this",
-            feed.config.name,
-            lifetime,
-            feed.short_lived_generations,
-        )
-        # Reported once per run of failures rather than on every attempt: the
-        # condition persists, and repeating it every 30s buries the log the
-        # way the warning it replaces already did.
+        if not feed.branches_rebuilt:
+            # Reported once per run of failures rather than on every attempt:
+            # the condition persists, and repeating it every 30s buries the log
+            # the way the warning it replaces already did. The post-rebuild
+            # case says its own piece below.
+            LOG.error(
+                "feed %s: connected and died within %.1fs on %d consecutive "
+                "attempts; the stream reaches the wall but no video follows it. "
+                "Retrying alone does not clear this",
+                feed.config.name,
+                lifetime,
+                feed.short_lived_generations,
+            )
         feed.short_lived_generations = 0
         if feed.branches_rebuilt:
-            # Already tried, and the feed is wedging again. Say so plainly
-            # rather than tearing the same branches down a second time.
-            LOG.error(
-                "feed %s: still wedging after a branch rebuild, so the stale "
-                "state is not in the branch. Check the feed from this machine "
-                "(gst-launch-1.0 rtspsrc location=... ! fakesink); if that "
-                "plays, only restarting viewwall will clear it",
-                feed.config.name,
+            # One short generation is the whole answer here: the rebuild ran
+            # before it started, so it has already been tested, and waiting for
+            # two more asks the same question at 30s a turn. The state is
+            # outside the branch, and nothing this process can reach clears it,
+            # so hand it to the service manager -- a few seconds of black wall
+            # in place of one tile black indefinitely.
+            self._fatal(
+                f"feed {feed.config.name}: still wedging after a branch "
+                "rebuild, so the stale state is outside the branch. Restarting "
+                "the wall is the only thing left that clears it"
             )
             return
         feed.branches_rebuilt = self._rebuild_feed_branches(feed)
-        if feed.branches_rebuilt:
-            feed.rebuilt_at_generation = feed.generation
 
     def _rebuild_feed_branches(self, feed: FeedRuntime) -> bool:
         """Recreate one feed's branch elements, leaving every other feed alone.
@@ -998,6 +1007,14 @@ class WallRuntime:
     def _mark_feed_stable(self, feed_name: str, generation: int) -> bool:
         feed = self.feeds[feed_name]
         if feed.generation == generation and feed.state == "healthy":
+            if feed.branches_rebuilt:
+                LOG.warning(
+                    "feed %s: healthy for %ds after its branch was rebuilt, so "
+                    "the rebuild cleared the wedge",
+                    feed_name,
+                    self.FEED_STABLE_SECONDS,
+                )
+                feed.branches_rebuilt = False
             feed.failures = 0
             feed.short_lived_generations = 0
             feed.stable_source_id = None

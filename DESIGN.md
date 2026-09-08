@@ -97,6 +97,64 @@ Viewwall exits non-zero and systemd reconstructs the complete wall. The
 service also uses systemd's process watchdog to recover if the GLib control
 loop hangs.
 
+### When a feed connects but no video follows
+
+A feed is called healthy on its first buffer, so a feed that gets its stream
+and immediately loses it logs the same "video is healthy" line as one that ran
+for hours. Observed in production: a camera that reconnected, reported
+healthy, and died on the stall watchdog five seconds later, over twenty
+generations deep, while the other eight viewports ran normally. Retrying does
+not clear it, because the state that is wedged is not in the part a retry
+replaces.
+
+Three consecutive generations that reach healthy and die within fifteen
+seconds escalate. The first response rebuilds that feed's branch queue and
+videocrop -- the only elements a feed restart does not already replace. One
+more short generation after that ends it: the wall fails and the service
+manager starts it again. Several seconds of black wall replaces one viewport
+black indefinitely.
+
+The post-rebuild threshold is one generation rather than three because the
+rebuild has already been tested by the time that generation dies -- it ran
+before the generation started. Waiting for two more asks the same question
+under the same conditions, and they are the expensive ones: the retry backoff
+has reached 30s by then, so they add a minute of black tile and no
+information. Reconnect, reconnect, reconnect, rebuild, restart takes about
+28 seconds end to end.
+
+The ladder is per episode rather than per process: a feed that recovers and
+fails again an hour later starts at the first reconnect, not at the rebuild.
+Two different thresholds decide that, because the questions differ. Fifteen
+seconds is enough for a generation to stop counting against the feed, but
+recovery is only declared once the feed has been healthy for
+`FEED_STABLE_SECONDS` -- the same interval the retry backoff already treats as
+proof a feed is well. A single threshold would mean a feed limping at sixteen
+second intervals reset the ladder on every generation and never escalated at
+all. The counters live on the feed, so one camera's history never pushes
+another up the ladder.
+
+Only a generation that reached healthy counts toward this. A camera that is
+powered down, or behind a switch that is, never gets there: it fails before
+the healthy line the measurement starts from, so an outage of any length
+retries forever without restarting the wall. Verified on hardware by cutting
+the switch feeding three cameras -- several minutes down, no escalation, and
+a clean recovery when it came back.
+
+The unit never gives up on the restart (`StartLimitIntervalSec=0`). A stopped
+wall shows nothing, while one that keeps restarting still shows every healthy
+camera between restarts, and the faults that reach this rung have only ever
+affected a single feed. `RestartSteps=5` with `RestartMaxDelaySec=60` spreads
+the retries from five seconds out to a minute, so a wall that cannot stay up
+stops hammering the decoder and filling the journal without ever going dark
+for good. This mirrors what `restart: unless-stopped` already does under
+Docker.
+
+The two ramp settings need systemd 254, so Trixie has them and Bookworm does
+not. An older systemd logs them as unknown keys and ignores them, leaving a
+flat five-second retry that still never gives up. That is why the first delay
+is five seconds rather than one: on the release that cannot ramp, the first
+delay is the only delay.
+
 ## Layout model
 
 Viewports use normalized rectangles. Each coordinate is one exact fraction,

@@ -1301,7 +1301,6 @@ def _lifetime_feed() -> object:
         healthy_at=None,
         short_lived_generations=0,
         branches_rebuilt=False,
-        rebuilt_at_generation=None,
         generation=1,
     )
 
@@ -1320,6 +1319,9 @@ def _wedging_runtime(rebuilt: list[str] | None = None) -> WallRuntime:
     """A runtime whose branch rebuild records the call instead of doing it."""
     runtime = object.__new__(WallRuntime)
     runtime.viewports = {}
+    runtime._fatal_error = None
+    runtime.config = SimpleNamespace(viewports=[])
+    runtime.stop = lambda: None  # type: ignore[method-assign]
     if rebuilt is not None:
         runtime._rebuild_feed_branches = lambda feed: (  # type: ignore[method-assign]
             rebuilt.append(feed.config.name) or True
@@ -1360,20 +1362,130 @@ def test_the_branch_is_rebuilt_only_once(caplog) -> None:
         _wedge(runtime, feed)
     assert rebuilt == ["cam"]
     assert "still wedging after a branch rebuild" in caplog.text
-    assert "only restarting viewwall" in caplog.text
 
 
-def test_a_rebuild_that_worked_says_so(caplog) -> None:
+def test_a_wedge_surviving_the_rebuild_restarts_the_wall() -> None:
+    # The state is outside the branch by this point, so only a new process
+    # clears it: the wall fails and the service manager starts it again.
     rebuilt: list[str] = []
     runtime = _wedging_runtime(rebuilt)
     feed = _lifetime_feed()
     _wedge(runtime, feed)
-    # The next generation runs well past the threshold.
-    feed.healthy_at = time.monotonic() - WallRuntime.SHORT_GENERATION_SECONDS - 30
-    with caplog.at_level("WARNING"):
+    assert runtime._fatal_error is None
+    _wedge(runtime, feed)
+    assert runtime._fatal_error is not None
+    assert "cam" in runtime._fatal_error
+    assert "wedging" in runtime._fatal_error
+
+
+def test_the_restarting_wall_schedules_no_further_retry() -> None:
+    # _fatal() quits the loop; a retry scheduled after it would fire against a
+    # pipeline that is already going away.
+    scheduled: list[str] = []
+    runtime = _wedging_runtime([])
+    runtime._stopping = False
+    feed_stub = _lifetime_feed()
+    feed_stub.failures = 0
+    feed_stub.state = "healthy"
+    runtime.feeds = {"cam": feed_stub}
+    runtime._teardown_feed_attempt = lambda feed: None  # type: ignore[method-assign]
+    runtime._select_alternate_for_failed_feed = lambda name: None  # type: ignore[method-assign]
+    runtime._schedule_feed_retry = lambda feed: (  # type: ignore[method-assign]
+        scheduled.append(feed.config.name)
+    )
+    runtime.stop = lambda: setattr(runtime, "_stopping", True)  # type: ignore[method-assign]
+    feed = runtime.feeds["cam"]
+    feed.state = "healthy"
+    for _ in range(WallRuntime.SHORT_GENERATION_LIMIT * 2):
+        feed.state = "healthy"
+        feed.healthy_at = time.monotonic()
+        runtime._restart_feed("cam", feed.generation, "watchdog")
+    assert runtime._fatal_error is not None
+    # The retries before the escalation are fine; none after it.
+    assert scheduled and len(scheduled) < WallRuntime.SHORT_GENERATION_LIMIT * 2
+
+
+def test_one_generation_after_the_rebuild_restarts_the_wall() -> None:
+    # The rebuild ran before this generation started, so this generation is
+    # the test of it. Two more would repeat the same question at 30s a turn.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    feed = _lifetime_feed()
+    _wedge(runtime, feed)
+    assert rebuilt == ["cam"] and runtime._fatal_error is None
+    feed.healthy_at = time.monotonic()
+    runtime._note_generation_lifetime(feed)
+    assert runtime._fatal_error is not None
+    # And no second rebuild was attempted on the way there.
+    assert rebuilt == ["cam"]
+
+
+def test_a_feed_that_recovers_after_the_rebuild_starts_the_ladder_over() -> None:
+    # The cooldown is "did it actually work", not a timer: one generation
+    # outliving the threshold clears the rebuild flag, so a fault minutes later
+    # begins at reconnect again rather than jumping to the restart.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    feed = _lifetime_feed()
+    _wedge(runtime, feed)
+    feed.state = "healthy"
+    runtime.feeds = {"cam": feed}
+    runtime._mark_feed_stable("cam", feed.generation)
+    assert not feed.branches_rebuilt
+    # A fresh episode gets the full three reconnects before rebuilding again.
+    feed.healthy_at = time.monotonic()
+    runtime._note_generation_lifetime(feed)
+    assert runtime._fatal_error is None
+    assert rebuilt == ["cam"]
+    _wedge(runtime, feed, times=WallRuntime.SHORT_GENERATION_LIMIT - 1)
+    assert rebuilt == ["cam", "cam"]
+    assert runtime._fatal_error is None
+
+
+def test_a_camera_that_is_off_never_restarts_the_wall() -> None:
+    # The property the restart depends on: a feed that never reaches healthy
+    # cannot advance the wedge counter, so an outage of any length -- a camera
+    # powered down, a switch pulled -- retries forever without taking the wall
+    # with it. Measured on real hardware: a switch cut for several minutes
+    # produced no escalation at all.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    feed = _lifetime_feed()
+    for _ in range(WallRuntime.SHORT_GENERATION_LIMIT * 10):
+        feed.healthy_at = None
         runtime._note_generation_lifetime(feed)
+    assert runtime._fatal_error is None
+    assert rebuilt == []
+    assert feed.short_lived_generations == 0
+
+
+def test_a_rebuild_that_worked_says_so(caplog) -> None:
+    # Recovery is declared by the stable marker, not by one generation
+    # outliving the short threshold: a feed limping just past it would
+    # otherwise reset the ladder forever and never escalate.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    feed = _lifetime_feed()
+    _wedge(runtime, feed)
+    feed.state = "healthy"
+    runtime.feeds = {"cam": feed}
+    with caplog.at_level("WARNING"):
+        runtime._mark_feed_stable("cam", feed.generation)
     assert "the rebuild cleared the wedge" in caplog.text
     assert not feed.branches_rebuilt
+
+
+def test_outliving_the_short_threshold_is_not_yet_recovery() -> None:
+    # A generation longer than SHORT_GENERATION_SECONDS stops counting against
+    # the feed, but the rebuild flag survives until FEED_STABLE_SECONDS.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    feed = _lifetime_feed()
+    _wedge(runtime, feed)
+    feed.healthy_at = time.monotonic() - WallRuntime.SHORT_GENERATION_SECONDS - 1
+    runtime._note_generation_lifetime(feed)
+    assert feed.short_lived_generations == 0
+    assert feed.branches_rebuilt
 
 
 def test_one_short_generation_is_not_enough(caplog) -> None:

@@ -2,6 +2,11 @@
 Description=DRM/KMS camera wall
 After=network-online.target
 Wants=network-online.target
+# A wall that keeps restarting still shows every healthy camera between
+# restarts, so it never gives up: a stopped unit shows nothing at all, and the
+# faults that get this far have only ever affected one feed. The backoff below
+# keeps a wall that cannot stay up from cycling every few seconds.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
@@ -14,7 +19,14 @@ Environment=GST_REGISTRY_1_0=/var/cache/viewwall/registry.bin
 Environment=XDG_CACHE_HOME=/var/cache/viewwall
 ExecStart=/usr/bin/viewwall --config /etc/viewwall/viewwall.toml run
 Restart=always
+# 5s before the first restart, growing over five steps to a minute if they
+# keep coming (measured: 5, 8, 14, 23, 36, 60). A transient fault recovers as
+# fast as it always did; a persistent one stops hammering the decoder and
+# filling the journal. Older systemd ignores the two ramp settings and retries
+# at a flat 5s, which is why that floor is not lower.
 RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
 WatchdogSec=30
 TimeoutStopSec=15
 StandardOutput=journal

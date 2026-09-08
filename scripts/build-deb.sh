@@ -13,7 +13,9 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
 [ -n "$version" ] || { echo "cannot read version from pyproject.toml" >&2; exit 1; }
 revision=${DEB_REVISION:-1}
 pkgdir=$(mktemp -d)
-trap 'rm -rf "$pkgdir"' EXIT
+dh_systemd=$(mktemp)
+dh_scratch=$(mktemp)
+trap 'rm -rf "$pkgdir" "$dh_systemd" "$dh_scratch"' EXIT
 # mktemp creates 0700; the package root must be world-readable like any other.
 chmod 0755 "$pkgdir"
 
@@ -72,15 +74,26 @@ recs=$(awk '/^Recommends:/{sub(/^Recommends: /,""); print}' packaging/debian/con
 
 install -m 0755 packaging/debian/postinst "$pkgdir/DEBIAN/postinst"
 install -m 0755 packaging/debian/postrm "$pkgdir/DEBIAN/postrm"
-# debhelper is not involved, so drop its substitution markers.
-sed -i '/#DEBHELPER#/d' "$pkgdir/DEBIAN/postinst" "$pkgdir/DEBIAN/postrm"
 
-# systemd integration that debhelper would normally generate.
-cat >> "$pkgdir/DEBIAN/postinst" <<'EOF'
+# systemd integration that debhelper would normally generate, substituted at
+# the marker rather than appended: the scripts end in "exit 0", so anything
+# added after it is dead code and the unit file silently never reloads.
+cat > "$dh_systemd" <<'EOF'
 if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
 fi
 EOF
+for script in postinst postrm; do
+    awk -v insert="$dh_systemd" '
+        /^#DEBHELPER#$/ {
+            while ((getline line < insert) > 0) print line
+            next
+        }
+        { print }
+    ' "$pkgdir/DEBIAN/$script" > "$dh_scratch"
+    cat "$dh_scratch" > "$pkgdir/DEBIAN/$script"
+    chmod 0755 "$pkgdir/DEBIAN/$script"
+done
 cat > "$pkgdir/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e

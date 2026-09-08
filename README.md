@@ -409,6 +409,15 @@ credentials, or a codec viewwall cannot decode on that model.
 plane per viewport, and hardware runs out of them. The log reports a resource
 error naming the viewport that failed.
 
+**The wall restarted itself after a camera came back.** A feed that connects,
+reports healthy, and dies within seconds -- three times in a row, and again
+after viewwall rebuilds that feed's branch -- is wedged on state a retry
+cannot reach. The log says so and names the feed, and the wall exits so the
+service manager gives it a clean process. A camera that is simply off or
+unreachable never triggers this; it retries indefinitely instead. If it
+keeps happening, the restarts spread out from five seconds to a minute apart
+rather than stopping, so the wall keeps showing whichever cameras are healthy.
+
 ## How it works
 
 [DESIGN.md](DESIGN.md) covers the media path, the recovery model, how viewports are
