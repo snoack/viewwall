@@ -1475,6 +1475,76 @@ def test_the_wall_may_be_restarted_again_once_the_cooldown_passes(
     assert runtime._fatal_error is not None
 
 
+def _tile_runtime(last_output_at, feed_state="healthy"):
+    """A wall with one viewport whose branch rebuild records the call."""
+    runtime = object.__new__(WallRuntime)
+    runtime._stopping = False
+    runtime._fatal_error = None
+    runtime.rebuilt: list[str] = []
+    viewport = SimpleNamespace(
+        config=SimpleNamespace(index=1),
+        active_feed="cam",
+        last_output_at=last_output_at,
+    )
+    runtime.viewports = {"v1": viewport}
+    runtime.feeds = {"cam": SimpleNamespace(state=feed_state)}
+    runtime._rebuild_one_branch_safely = (  # type: ignore[method-assign]
+        lambda vp, name: runtime.rebuilt.append(name)
+    )
+    return runtime, viewport
+
+
+def test_a_tile_that_goes_quiet_under_a_healthy_feed_is_repaired(monkeypatch) -> None:
+    # The failure no other signal can see: the watchdog and the healthy line
+    # both sit inside the feed bin, so a branch that stops delivering leaves
+    # the feed reporting healthy and the tile black with nothing logged.
+    runtime, _ = _tile_runtime(last_output_at=100.0)
+    monkeypatch.setattr(
+        "viewwall.gst_runtime.time.monotonic",
+        lambda: 100.0 + WallRuntime.TILE_QUIET_SECONDS + 1.0,
+    )
+    assert runtime._poll_viewport_output() is True
+    assert runtime.rebuilt == ["cam"]
+
+
+def test_a_tile_still_delivering_is_left_alone(monkeypatch) -> None:
+    runtime, _ = _tile_runtime(last_output_at=100.0)
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 105.0)
+    runtime._poll_viewport_output()
+    assert runtime.rebuilt == []
+
+
+def test_a_feed_already_being_replaced_is_left_to_the_watchdog(monkeypatch) -> None:
+    # Otherwise a feed-side stall trips both this and the watchdog, and the
+    # branch is rebuilt under a feed bin that is already being replaced.
+    runtime, _ = _tile_runtime(last_output_at=100.0, feed_state="backoff")
+    monkeypatch.setattr(
+        "viewwall.gst_runtime.time.monotonic",
+        lambda: 100.0 + WallRuntime.TILE_QUIET_SECONDS + 1.0,
+    )
+    runtime._poll_viewport_output()
+    assert runtime.rebuilt == []
+
+
+def test_the_quiet_window_outlasts_the_stall_watchdog() -> None:
+    # The ordering that keeps the two from racing.
+    assert (
+        WallRuntime.TILE_QUIET_SECONDS * 1000 > WallRuntime.FEED_STALL_TIMEOUT_MS
+    )
+
+
+def test_a_repaired_tile_is_given_a_fresh_window(monkeypatch) -> None:
+    # Without this the next poll would see the same stale timestamp and
+    # rebuild again every five seconds.
+    runtime, viewport = _tile_runtime(last_output_at=100.0)
+    now = 100.0 + WallRuntime.TILE_QUIET_SECONDS + 1.0
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: now)
+    runtime._poll_viewport_output()
+    assert viewport.last_output_at == now
+    runtime._poll_viewport_output()
+    assert runtime.rebuilt == ["cam"]
+
+
 def _wedging_runtime(rebuilt: list[str] | None = None) -> WallRuntime:
     """A runtime whose branch rebuild records the call instead of doing it."""
     runtime = object.__new__(WallRuntime)

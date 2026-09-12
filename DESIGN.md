@@ -147,6 +147,17 @@ because a camera whose encoder freezes while its TCP session stays up starves
 the watchdog exactly like shared state does, and no number of restarts fixes
 the camera.
 
+That covers every failure the feed bin can report. It cannot cover the branch
+itself: the watchdog follows the decoder and the healthy line is measured
+leaving the feed bin, both upstream of the branch, so a branch that stops
+delivering leaves its feed reporting healthy, posts no bus message, and blacks
+the tile with nothing to notice. A second check watches the other end -- if
+nothing reaches a viewport's output queue for `TILE_QUIET_SECONDS` while its
+feed keeps delivering, the branch between them is rebuilt. The window is
+deliberately longer than the stall watchdog so that a feed-side stall reaches
+the watchdog first and replaces the feed bin, rather than both firing and
+rebuilding a branch under a feed that is already being replaced.
+
 An earlier version counted consecutive short generations and read RTP packet
 counters to answer the third question. It twice read a real wedge as an outage
 in production and escalated nothing: the counters were sampled on a timer, and

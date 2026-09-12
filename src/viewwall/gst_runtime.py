@@ -120,6 +120,9 @@ class ViewportRuntime:
     crop_values: SourceCrop | None = None
     pixel_aspect_ratio: Fraction | None = None
     queued_frames: int = 0
+    # When a buffer last reached this viewport's output queue, so a tile that
+    # goes quiet under a healthy feed can be told from one that never started.
+    last_output_at: float | None = None
     metrics_since: float | None = None
     metrics_rotated: bool = False
     # Cumulative sink counters, not per-interval: kmssink reports totals, so
@@ -162,6 +165,12 @@ class WallRuntime:
     # session stays up starves the stall watchdog exactly like shared state
     # does, and no number of restarts fixes the camera; without this it would
     # take the wall down on every episode.
+    # How long a viewport may show nothing while its feed reports healthy
+    # before the branch between them is rebuilt. Longer than the stall
+    # watchdog, deliberately: a feed-side stall must reach the watchdog first
+    # and replace the feed bin, rather than both firing and rebuilding a
+    # branch under a feed that is already being replaced.
+    TILE_QUIET_SECONDS = 20.0
     FATAL_COOLDOWN_SECONDS = 600.0
     MIN_STALL_TIMEOUT_MS = 5_000
     FEED_STALL_TIMEOUT_MS = 15_000
@@ -875,6 +884,58 @@ class WallRuntime:
             return False
         return time.monotonic() - last < self.FATAL_COOLDOWN_SECONDS
 
+    def _poll_viewport_output(self) -> bool:
+        """Rebuild the branch behind a tile that has gone quiet on its own.
+
+        Every other failure signal in the wall sits inside the feed bin: the
+        stall watchdog follows the decoder, and a feed is called healthy on the
+        first buffer leaving that bin. Both are upstream of the branch, so a
+        branch that stops delivering -- a queue stuck behind a selector, a
+        videocrop that renegotiated badly -- leaves the feed bin reporting
+        healthy, posts no bus message, and blacks the tile indefinitely. That
+        is the one failure a branch rebuild exists to repair, and until now
+        nothing could see it.
+
+        Measured at the output queue rather than at the sink, because
+        _show_viewport_offline() replaces the sink on every outage and a probe
+        left on the old one goes quiet for the rest of the process.
+        """
+        if self._stopping:
+            return False
+        now = time.monotonic()
+        for viewport in self.viewports.values():
+            feed_name = viewport.active_feed
+            if feed_name is None:
+                continue
+            feed = self.feeds.get(feed_name)
+            # Only a feed that is currently delivering: one in backoff or
+            # starting is already being replaced, and the stall watchdog owns
+            # that case.
+            if feed is None or feed.state != "healthy":
+                continue
+            last = viewport.last_output_at
+            if last is None or now - last < self.TILE_QUIET_SECONDS:
+                continue
+            viewport.last_output_at = now
+            LOG.error(
+                "viewport %d: nothing reached the screen for %.0fs while feed "
+                "%s kept delivering, so the branch between them is at fault. "
+                "Rebuilding it",
+                viewport.config.index,
+                now - last,
+                feed_name,
+            )
+            self._rebuild_one_branch_safely(viewport, feed_name)
+        return True
+
+    def _rebuild_one_branch_safely(
+        self, viewport: ViewportRuntime, feed_name: str
+    ) -> None:
+        try:
+            self._rebuild_one_branch(viewport, feed_name)
+        except RuntimeDependencyError as exc:
+            self._fatal(f"feed {feed_name}: branch rebuild failed: {exc}")
+
     def _rebuild_feed_branches(self, feed: FeedRuntime) -> bool:
         """Recreate one feed's branch elements, leaving every other feed alone.
 
@@ -1310,6 +1371,10 @@ class WallRuntime:
         # newly selected branch's ALLOCATION query from reaching kmssink.
         viewport.valve.set_property("drop", False)
         viewport.active_feed = feed_name
+        # A switch leaves a gap at the output while the new branch starts, so
+        # the incoming feed gets a fresh window rather than inheriting the
+        # silence of the one it replaced.
+        viewport.last_output_at = time.monotonic()
         # Frames counted before the switch came from the previous feed. Left
         # in place they would be averaged with the new one's, and a viewport
         # rotating a 3fps and a 24fps camera would report a meaningless ~13.
@@ -1904,6 +1969,7 @@ class WallRuntime:
         viewport = self.viewports.get(viewport_name)
         if viewport is not None:
             viewport.queued_frames += 1
+            viewport.last_output_at = time.monotonic()
         return self.Gst.PadProbeReturn.OK
 
     def _queue_delay_ms(self, queue: Any) -> float | None:
@@ -2097,6 +2163,9 @@ class WallRuntime:
             self.close()
             raise RuntimeDependencyError("GStreamer pipeline refused PLAYING state")
         self._enable_systemd_watchdog()
+        self.GLib.timeout_add_seconds(
+            5, self._poll_viewport_output
+        )
         self._start_metrics()
         self._notify_systemd("READY=1\nSTATUS=Camera wall running")
         single = len(self.config.displays) == 1
