@@ -85,6 +85,18 @@ Any of these conditions tears down only the affected feed bin and recreates it
 after a jittered 1, 2, 5, 10, then 30 second backoff. The 30 second delay is
 retried indefinitely and the backoff resets after one minute of healthy video.
 
+Every one of those signals is downstream of a linked video pad, so a
+generation that connects and never links one is caught by none of them: the
+watchdog follows a decoder that was never attached, and the escalation ladder
+below only judges generations that reached healthy. A generation therefore
+gets 30 seconds to link a pad before it is restarted regardless. Observed in
+production after a switch was power cycled: the NVR closed its side of a
+connection, the socket stayed in CLOSE-WAIT, `rtspsrc` read nothing and so
+never reached its own `tcp-timeout`, and the feed sat silent for 25 minutes
+with no watchdog, no retry and no escalation while two other feeds on the
+same switch recovered normally. Measured connects on this wall take 1-2
+seconds, so the deadline has a wide margin over a slow camera.
+
 Rotating viewports skip feeds that are starting or in backoff and immediately use
 another healthy candidate when possible. A viewport with no healthy candidate
 closes a valve in that output branch and disables its KMS plane instead of

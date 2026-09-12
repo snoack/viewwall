@@ -1305,6 +1305,75 @@ def _lifetime_feed() -> object:
     )
 
 
+def _connecting_feed(**over):
+    """A generation that has started but not yet linked a video pad."""
+    feed = SimpleNamespace(
+        config=SimpleNamespace(name="cam"),
+        generation=3,
+        state="starting",
+        video_linked=False,
+        connect_source_id=77,
+    )
+    for key, value in over.items():
+        setattr(feed, key, value)
+    return feed
+
+
+def _connect_runtime(feed):
+    runtime = object.__new__(WallRuntime)
+    runtime._stopping = False
+    runtime.feeds = {"cam": feed}
+    runtime.restarts = []
+    runtime._request_feed_restart = (  # type: ignore[method-assign]
+        lambda name, gen, reason: runtime.restarts.append((name, gen, reason))
+    )
+    return runtime
+
+
+def test_a_generation_that_never_links_video_is_restarted() -> None:
+    # The failure this exists for: after a switch was power cycled the NVR
+    # half-closed the socket, rtspsrc read nothing and never hit its own
+    # timeout, and the feed sat silent with no watchdog and no ladder to
+    # catch it, because both live downstream of a video pad it never linked.
+    feed = _connecting_feed()
+    runtime = _connect_runtime(feed)
+    assert runtime._give_up_on_connect("cam", 3) is False
+    assert len(runtime.restarts) == 1
+    assert "no video pad" in runtime.restarts[0][2]
+    # The timer is spent, and must not be cancelled a second time.
+    assert feed.connect_source_id is None
+
+
+def test_a_feed_that_linked_video_is_left_alone() -> None:
+    runtime = _connect_runtime(_connecting_feed(video_linked=True))
+    runtime._give_up_on_connect("cam", 3)
+    assert runtime.restarts == []
+
+
+def test_a_stale_connect_deadline_is_ignored() -> None:
+    # The generation it was armed for is already gone.
+    feed = _connecting_feed(generation=4)
+    runtime = _connect_runtime(feed)
+    runtime._give_up_on_connect("cam", 3)
+    assert runtime.restarts == []
+    # And it must not disarm the deadline the live generation is relying on:
+    # that id belongs to generation 4, not to the timer that just fired.
+    assert feed.connect_source_id == 77
+
+
+def test_a_feed_already_in_backoff_is_not_restarted_again() -> None:
+    runtime = _connect_runtime(_connecting_feed(state="backoff"))
+    runtime._give_up_on_connect("cam", 3)
+    assert runtime.restarts == []
+
+
+def test_a_stopping_wall_does_not_restart_a_connecting_feed() -> None:
+    runtime = _connect_runtime(_connecting_feed())
+    runtime._stopping = True
+    runtime._give_up_on_connect("cam", 3)
+    assert runtime.restarts == []
+
+
 def test_a_feed_that_never_connected_is_not_reported_as_short_lived(caplog) -> None:
     # No stream at all is the ordinary case the restart line already covers.
     runtime = object.__new__(WallRuntime)

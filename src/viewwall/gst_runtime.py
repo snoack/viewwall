@@ -94,6 +94,7 @@ class FeedRuntime:
     failures: int = 0
     retry_source_id: int | None = None
     stable_source_id: int | None = None
+    connect_source_id: int | None = None
 
 
 @dataclass
@@ -146,6 +147,18 @@ class WallRuntime:
     SHORT_GENERATION_LIMIT = 3
 
     STALL_FRAMES = 45
+    # A generation gets this long to link a video pad before it is restarted.
+    # Every recovery the wall has sits downstream of that link: the stall
+    # watchdog follows the decoder, so it never runs when no decoder was
+    # attached, and the wedge ladder only counts generations that reached
+    # healthy. A generation that never links falls through both and waits
+    # forever. Observed in production after a switch was power cycled: the
+    # NVR closed its side, the socket stayed in CLOSE-WAIT, rtspsrc read
+    # nothing and so never hit its own tcp-timeout, and the feed sat silent
+    # with no watchdog, no retry and no escalation until the wall was
+    # restarted by hand. Measured connects on this wall take 1-2s, so 30
+    # leaves a wide margin over a slow camera while still bounding the hang.
+    FEED_CONNECT_SECONDS = 30
     MIN_STALL_TIMEOUT_MS = 5_000
     FEED_STALL_TIMEOUT_MS = 15_000
     FEED_STABLE_SECONDS = 60
@@ -665,6 +678,12 @@ class WallRuntime:
         self._prime_offline_viewports_for_feed(feed.config.name)
         if not feed_bin.sync_state_with_parent():
             raise RuntimeDependencyError(f"could not start feed {feed.config.name}")
+        feed.connect_source_id = self.GLib.timeout_add_seconds(
+            self.FEED_CONNECT_SECONDS,
+            self._give_up_on_connect,
+            feed.config.name,
+            generation,
+        )
         LOG.info("feed %s: starting generation %d", feed.config.name, generation)
 
     def _teardown_feed_attempt(self, feed: FeedRuntime) -> None:
@@ -672,6 +691,9 @@ class WallRuntime:
         if feed.stable_source_id is not None:
             self.GLib.source_remove(feed.stable_source_id)
             feed.stable_source_id = None
+        if feed.connect_source_id is not None:
+            self.GLib.source_remove(feed.connect_source_id)
+            feed.connect_source_id = None
         if feed_bin is not None:
             bin_name = feed_bin.get_name()
             feed_bin.set_locked_state(True)
@@ -1006,6 +1028,30 @@ class WallRuntime:
             self._mark_feed_stable,
             feed_name,
             generation,
+        )
+        return False
+
+    def _give_up_on_connect(self, feed_name: str, generation: int) -> bool:
+        """Restart a generation that never linked video, so it cannot hang.
+
+        Nothing else can end it. The stall watchdog is downstream of a decoder
+        that was never attached, and _note_generation_lifetime() only judges
+        generations that reached healthy, so a feed stuck here is outside every
+        other recovery path the wall has.
+        """
+        feed = self.feeds[feed_name]
+        if self._stopping or feed.generation != generation:
+            # A timer this stale was already cancelled at teardown, so it
+            # belongs to no live generation: clearing the id here would
+            # disarm the deadline the current one is relying on.
+            return False
+        feed.connect_source_id = None
+        if feed.video_linked or feed.state in ("backoff", "unsupported"):
+            return False
+        self._request_feed_restart(
+            feed_name,
+            generation,
+            f"no video pad after {self.FEED_CONNECT_SECONDS}s",
         )
         return False
 
@@ -1448,6 +1494,9 @@ class WallRuntime:
             result = pad.link(feed.depay.get_static_pad("sink"))
             if result == self.Gst.PadLinkReturn.OK:
                 feed.video_linked = True
+                if feed.connect_source_id is not None:
+                    self.GLib.source_remove(feed.connect_source_id)
+                    feed.connect_source_id = None
                 LOG.info(
                     "feed %s: %s video connected via %s",
                     feed.config.name,
