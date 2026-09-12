@@ -123,6 +123,9 @@ class ViewportRuntime:
     # When a buffer last reached this viewport's output queue, so a tile that
     # goes quiet under a healthy feed can be told from one that never started.
     last_output_at: float | None = None
+    # Set when a rotation switches feeds, cleared by the first frame that
+    # arrives afterwards, which reports how long the tile took to change.
+    switched_at: float | None = None
     metrics_since: float | None = None
     metrics_rotated: bool = False
     # Cumulative sink counters, not per-interval: kmssink reports totals, so
@@ -1374,7 +1377,24 @@ class WallRuntime:
         # A switch leaves a gap at the output while the new branch starts, so
         # the incoming feed gets a fresh window rather than inheriting the
         # silence of the one it replaced.
-        viewport.last_output_at = time.monotonic()
+        now = time.monotonic()
+        viewport.last_output_at = now
+        if previous_feed is not None and previous_feed != feed_name:
+            # Twice a minute per rotating viewport against 230 decoded frames
+            # a second, so the cost does not register. The queue behind this
+            # tile still holds the outgoing feed's frames, and they are shown
+            # before any of the incoming feed's: at the rate nine planes
+            # actually flip, a full queue is seconds of the wrong camera. The
+            # pair of numbers says whether that is what happened.
+            viewport.switched_at = now
+            depth = self._queue_delay_ms(viewport.output_queue)
+            LOG.info(
+                "viewport %d: switching from %s to %s with %s of video queued",
+                viewport.config.index,
+                previous_feed,
+                feed_name,
+                "unknown depth" if depth is None else f"{depth:.0f}ms",
+            )
         # Frames counted before the switch came from the previous feed. Left
         # in place they would be averaged with the new one's, and a viewport
         # rotating a 3fps and a 24fps camera would report a meaningless ~13.
@@ -1969,7 +1989,20 @@ class WallRuntime:
         viewport = self.viewports.get(viewport_name)
         if viewport is not None:
             viewport.queued_frames += 1
-            viewport.last_output_at = time.monotonic()
+            now = time.monotonic()
+            viewport.last_output_at = now
+            if viewport.switched_at is not None:
+                # One comparison per frame, and the clock was read anyway. The
+                # rate a viewport actually changes at is invisible otherwise:
+                # the metrics window around a switch is too short to divide by,
+                # so it reports no rate at exactly the moment of interest.
+                LOG.info(
+                    "viewport %d: showing %s %.0fms after the switch",
+                    viewport.config.index,
+                    viewport.active_feed,
+                    (now - viewport.switched_at) * 1000.0,
+                )
+                viewport.switched_at = None
         return self.Gst.PadProbeReturn.OK
 
     def _queue_delay_ms(self, queue: Any) -> float | None:

@@ -1475,6 +1475,32 @@ def test_the_wall_may_be_restarted_again_once_the_cooldown_passes(
     assert runtime._fatal_error is not None
 
 
+def test_the_first_frame_after_a_switch_is_timed(monkeypatch, caplog) -> None:
+    # The metrics window around a switch is too short to divide by, so it
+    # reports no rate at exactly the moment of interest. This is the only
+    # measure of how long a tile takes to actually change.
+    runtime = object.__new__(WallRuntime)
+    runtime.Gst = SimpleNamespace(PadProbeReturn=SimpleNamespace(OK="OK"))
+    viewport = SimpleNamespace(
+        config=SimpleNamespace(index=9),
+        active_feed="coop",
+        queued_frames=0,
+        last_output_at=None,
+        switched_at=100.0,
+    )
+    runtime.viewports = {"v9": viewport}
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 101.5)
+    with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
+        runtime._on_viewport_buffer(None, None, "v9")
+    assert "1500ms after the switch" in caplog.text
+    # Reported once per switch, not once per frame.
+    assert viewport.switched_at is None
+    with caplog.at_level("INFO", logger="viewwall.gst_runtime"):
+        caplog.clear()
+        runtime._on_viewport_buffer(None, None, "v9")
+    assert caplog.text == ""
+
+
 def _tile_runtime(last_output_at, feed_state="healthy"):
     """A wall with one viewport whose branch rebuild records the call."""
     runtime = object.__new__(WallRuntime)
