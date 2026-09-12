@@ -287,16 +287,13 @@ RTSPS earns its keep when the feeds cross a network you do not control, or when
 the server has a certificate you can actually verify -- with `verify_tls` left
 at `true`, the guarantee is real.
 
-SRTP is **not supported**, and Protect asks for it by default: the URL in the
-app carries `?enableSrtp`, which has to come off. Left on, the stream connects
-and then fails because the payload cannot be decrypted -- Viewwall detects this
-from the negotiated SDP and stops that feed with a clear message rather than
-retrying forever.
-
-Removing the parameter is the only change needed. SRTP encrypts the media
-payload, which is separate from whether the control channel uses TLS, so
-`rtsps://` on 7441 works fine without it. See [DESIGN.md](DESIGN.md) for what
-implementing SRTP would involve.
+SRTP is **not supported**: drop `?enableSrtp` from the URL Protect shows. It is
+opt-in on both ports, so nothing else has to change -- SRTP encrypts the media
+payload, which is separate from whether the control channel uses TLS, and
+`rtsps://` on 7441 works without it. Left on, the stream connects and then
+fails because the payload cannot be decrypted; Viewwall detects this from the
+negotiated SDP and stops that feed with a clear message rather than retrying
+forever. See [DESIGN.md](DESIGN.md) for what supporting it would involve.
 
 ## Running in Docker
 

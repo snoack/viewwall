@@ -683,7 +683,9 @@ Viewwall detects this from the **negotiated SDP**, not the request URI: the
 RFC 4568 `a=crypto` key attribute (surfaced by `rtspsrc` as an `a-crypto` caps
 field) and the `RTP/SAVP` profile are standard, whereas *how* a client asks for
 SRTP is server-specific — UniFi Protect uses an `?enableSrtp` query parameter,
-other servers differ. Such a feed is retired permanently rather than retried:
+other servers differ. Either marker is enough on its own, which matters because
+Protect sets only the first: it announces `RTP/AVP` and attaches the key
+anyway. Such a feed is retired permanently rather than retried:
 
 ```text
 feed <name>: server negotiated SRTP, which Viewwall cannot decrypt;
@@ -694,14 +696,79 @@ Other viewports are unaffected, and a viewport left with no healthy feed goes bl
 rather than holding a stale frame. URIs are always passed to `rtspsrc`
 verbatim: no query parameter is inspected, rewritten, or stripped.
 
-Supporting it is feasible but unimplemented. Protect advertises the key in the
-SDP as RFC 4568 SDES, which `rtspsrc` surfaces on the stream caps but does not
-act on, because its built-in SRTP support is MIKEY-oriented:
+### Why rtspsrc will not do it
+
+Protect advertises the key in the SDP as RFC 4568 SDES, which `rtspsrc`
+surfaces on the stream caps:
 
 ```text
 a-crypto = "1 AES_CM_128_HMAC_SHA1_80 inline:<base64 key>"
 ```
 
-The key arrives inside the TLS-protected control channel, and `srtpdec` is
-available on this system, so the work is to read that caps field, base64-decode
-the key, and supply it through `rtspsrc`'s `request-rtp-key` signal.
+It never acts on it, for two independent reasons, both measured against a
+Protect NVR rather than inferred:
+
+* **The announced profile is `RTP/AVP`, not `RTP/SAVP`.** `rtspsrc` creates its
+  internal `srtpdec` only for the secure profiles, so for this stream one is
+  never built and the `request-rtp-key` signal is never emitted. Instrumented
+  against a live camera, it fired zero times while `a-crypto` was present.
+* **Its key handling is MIKEY-only.** `gst_sdp_media_parse_keymgmt()` reads
+  `a=key-mgmt` (RFC 4567 MIKEY); Protect sends `a=crypto` (RFC 4568 SDES) and
+  no `a=key-mgmt` at all. Even the `client-managed-mikey` path feeds the
+  returned caps to `gst_mikey_message_new_from_caps()`.
+
+Note that `rtspsrc`'s `sdes` property is unrelated: that is RFC 3550 RTCP
+Source Description (`cname`, `tool`), identity metadata sent outbound, with no
+field for a key.
+
+### The approach that works
+
+Leave `rtspsrc` in plain RTP mode and decrypt downstream, which needs no
+patched GStreamer. A `capssetter` retags the video pad as
+`application/x-srtp`, an ordinary `srtpdec` follows it, and the key is taken
+from the `on-sdp` signal (which fires about 0.2s before `pad-added`, so it is
+always in hand) and returned from `srtpdec`'s own `request-key`. Verified on
+the Pi against a live Protect camera: 479 frames in 20s, about 24fps.
+
+Estimated cost is roughly 80 lines: parsing `a=crypto` into SRTP caps, an
+`on-sdp` handler, two more elements spliced into `_build_codec_branch()`, and
+the failure test below. Both elements are already available -- `capssetter`
+from gst-plugins-good, `srtpdec` from gst-plugins-bad, which is already a
+package dependency.
+
+### Why it needs a failure test of its own
+
+Decryption happens downstream of the jitter buffer that
+[the wedge ladder](#when-a-feed-connects-but-no-video-follows) samples, so a
+wrong or expired key looks exactly like a wedge: packets arrive and are
+counted, no frames come out. Measured with no key supplied, `num-pushed` was
+378 against zero decoded frames, which `_source_went_quiet()` classifies as a
+wedge. That would walk a
+permanent key fault into a branch rebuild and then a wall restart, which cannot
+fix it -- the one thing the ladder must never do.
+
+`srtpdec` distinguishes the two directly through its `stats` property, and a
+decrypt failure would have to be tested for before the wedge test and routed to
+`_request_feed_stop()`, the same permanent retirement an SRTP stream gets
+today:
+
+| | `recv-count` | `recv-drop-count` | decoded |
+|---|---|---|---|
+| good key | 373 | 0 | 357 |
+| wrong key | 376 | 376 | 0 |
+
+One question is unresolved: whether `srtpdec` drops packets during normal
+re-keying. If it does, that test needs a threshold rather than `dropped > 0`,
+and a long-running feed may need a re-key path built on the `soft-limit` and
+`hard-limit` signals. Hours of continuous playback would settle it, and that
+should happen before any of this is written.
+
+### Why it is not implemented
+
+SRTP is opt-in on both ports: neither `rtsp://` on 7447 nor `rtsps://` on 7441
+offers `a=crypto` unless `?enableSrtp` is appended. Nothing forces it, so the
+code would carry a branch through the recovery path that no deployed feed
+exercises, and an untested branch inside the restart ladder is the failure
+class this design works hardest to avoid. The recipe above is recorded so that
+if Protect ever requires SRTP, the work is a known 80 lines rather than a
+research project.
