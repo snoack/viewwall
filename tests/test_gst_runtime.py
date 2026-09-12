@@ -1299,10 +1299,19 @@ def _lifetime_feed() -> object:
     return SimpleNamespace(
         config=SimpleNamespace(name="cam"),
         healthy_at=None,
-        short_lived_generations=0,
         branches_rebuilt=False,
+        fatal_at=None,
         generation=1,
     )
+
+
+STALL = "error from watchdog_cam: Watchdog triggered"
+SOURCE = "error from rtsp_cam: Could not read from resource."
+
+
+def _died(runtime, feed, reason: str = STALL, stalled: bool = True) -> None:
+    """One generation ending, the way _restart_feed reports it."""
+    runtime._note_generation_lifetime(feed, reason, stalled)
 
 
 def _connecting_feed(**over):
@@ -1374,14 +1383,96 @@ def test_a_stopping_wall_does_not_restart_a_connecting_feed() -> None:
     assert runtime.restarts == []
 
 
-def test_a_feed_that_never_connected_is_not_reported_as_short_lived(caplog) -> None:
-    # No stream at all is the ordinary case the restart line already covers.
-    runtime = object.__new__(WallRuntime)
+
+def test_a_camera_that_never_delivered_is_only_reconnected(monkeypatch) -> None:
+    # The guard that matters most: a camera that is off, or behind a switch
+    # that is, never reaches healthy however long it is down, so it can never
+    # rebuild a branch or take the wall down. Verified on hardware twice by
+    # power cycling the switch feeding three cameras.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
     feed = _lifetime_feed()
-    with caplog.at_level("ERROR"):
-        for _ in range(5):
-            runtime._note_generation_lifetime(feed)
-    assert "died within" not in caplog.text
+    for _ in range(50):
+        _died(runtime, feed)
+    assert rebuilt == []
+    assert runtime._fatal_error is None
+
+
+def test_a_feed_that_delivered_then_stalled_rebuilds_its_branch(monkeypatch) -> None:
+    # camera_23rd_st in production: fifteen generations, each reaching healthy
+    # and dying to the stall watchdog about five seconds later, with no
+    # escalation at all under the counting version this replaced.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 105.0)
+    feed = _lifetime_feed()
+    feed.healthy_at = 100.0
+    _died(runtime, feed)
+    assert rebuilt == ["cam"]
+    assert feed.branches_rebuilt is True
+
+
+def test_a_source_side_failure_never_rebuilds_the_branch(monkeypatch) -> None:
+    # The camera stopped sending. No repair here changes that, and on a
+    # rotating viewport the rebuild disturbs the feed sharing it.
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 105.0)
+    feed = _lifetime_feed()
+    feed.healthy_at = 100.0
+    for _ in range(10):
+        _died(runtime, feed, SOURCE, stalled=False)
+    assert rebuilt == []
+    assert runtime._fatal_error is None
+
+
+def test_a_generation_that_ran_a_while_is_left_alone(monkeypatch) -> None:
+    rebuilt: list[str] = []
+    runtime = _wedging_runtime(rebuilt)
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 200.0)
+    feed = _lifetime_feed()
+    feed.healthy_at = 100.0
+    _died(runtime, feed)
+    assert rebuilt == []
+
+
+def test_a_stall_after_the_rebuild_restarts_the_wall(monkeypatch) -> None:
+    runtime = _wedging_runtime([])
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 105.0)
+    feed = _lifetime_feed()
+    feed.healthy_at = 100.0
+    feed.branches_rebuilt = True
+    _died(runtime, feed)
+    assert runtime._fatal_error is not None
+    assert "outside the branch" in runtime._fatal_error
+
+
+def test_the_wall_is_not_restarted_twice_for_the_same_feed(monkeypatch) -> None:
+    # A camera whose encoder freezes while its TCP session stays up starves
+    # the watchdog exactly like shared state does, and no number of restarts
+    # fixes the camera.
+    runtime = _wedging_runtime([])
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: 105.0)
+    feed = _lifetime_feed()
+    feed.healthy_at = 100.0
+    feed.branches_rebuilt = True
+    feed.fatal_at = 100.0
+    _died(runtime, feed)
+    assert runtime._fatal_error is None
+
+
+def test_the_wall_may_be_restarted_again_once_the_cooldown_passes(
+    monkeypatch,
+) -> None:
+    runtime = _wedging_runtime([])
+    later = 100.0 + WallRuntime.FATAL_COOLDOWN_SECONDS + 10.0
+    monkeypatch.setattr("viewwall.gst_runtime.time.monotonic", lambda: later)
+    feed = _lifetime_feed()
+    feed.healthy_at = later - 5.0
+    feed.branches_rebuilt = True
+    feed.fatal_at = 100.0
+    _died(runtime, feed)
+    assert runtime._fatal_error is not None
 
 
 def _wedging_runtime(rebuilt: list[str] | None = None) -> WallRuntime:
@@ -1397,188 +1488,6 @@ def _wedging_runtime(rebuilt: list[str] | None = None) -> WallRuntime:
         )
     return runtime
 
-
-def _wedge(runtime: WallRuntime, feed: object, times: int | None = None) -> None:
-    for _ in range(times or WallRuntime.SHORT_GENERATION_LIMIT):
-        feed.healthy_at = time.monotonic()
-        runtime._note_generation_lifetime(feed)
-
-
-def test_a_feed_dying_straight_after_connecting_is_reported(caplog) -> None:
-    # The wedge seen in production: healthy on its first buffer, dead 5s
-    # later, dozens of generations deep, and the log said "video is healthy"
-    # every time.
-    rebuilt: list[str] = []
-    runtime = _wedging_runtime(rebuilt)
-    feed = _lifetime_feed()
-    with caplog.at_level("ERROR"):
-        _wedge(runtime, feed)
-    assert "connected and died within" in caplog.text
-    assert "cam" in caplog.text
-    # Detecting the wedge is what triggers the one repair a restart cannot do.
-    assert rebuilt == ["cam"]
-
-
-def test_the_branch_is_rebuilt_only_once(caplog) -> None:
-    # A second rebuild would tear down the same branches for a fault that has
-    # already been shown not to live there.
-    rebuilt: list[str] = []
-    runtime = _wedging_runtime(rebuilt)
-    feed = _lifetime_feed()
-    _wedge(runtime, feed)
-    caplog.clear()
-    with caplog.at_level("ERROR"):
-        _wedge(runtime, feed)
-    assert rebuilt == ["cam"]
-    assert "still wedging after a branch rebuild" in caplog.text
-
-
-def test_a_wedge_surviving_the_rebuild_restarts_the_wall() -> None:
-    # The state is outside the branch by this point, so only a new process
-    # clears it: the wall fails and the service manager starts it again.
-    rebuilt: list[str] = []
-    runtime = _wedging_runtime(rebuilt)
-    feed = _lifetime_feed()
-    _wedge(runtime, feed)
-    assert runtime._fatal_error is None
-    _wedge(runtime, feed)
-    assert runtime._fatal_error is not None
-    assert "cam" in runtime._fatal_error
-    assert "wedging" in runtime._fatal_error
-
-
-def test_the_restarting_wall_schedules_no_further_retry() -> None:
-    # _fatal() quits the loop; a retry scheduled after it would fire against a
-    # pipeline that is already going away.
-    scheduled: list[str] = []
-    runtime = _wedging_runtime([])
-    runtime._stopping = False
-    feed_stub = _lifetime_feed()
-    feed_stub.failures = 0
-    feed_stub.state = "healthy"
-    runtime.feeds = {"cam": feed_stub}
-    runtime._teardown_feed_attempt = lambda feed: None  # type: ignore[method-assign]
-    runtime._select_alternate_for_failed_feed = lambda name: None  # type: ignore[method-assign]
-    runtime._schedule_feed_retry = lambda feed: (  # type: ignore[method-assign]
-        scheduled.append(feed.config.name)
-    )
-    runtime.stop = lambda: setattr(runtime, "_stopping", True)  # type: ignore[method-assign]
-    feed = runtime.feeds["cam"]
-    feed.state = "healthy"
-    for _ in range(WallRuntime.SHORT_GENERATION_LIMIT * 2):
-        feed.state = "healthy"
-        feed.healthy_at = time.monotonic()
-        runtime._restart_feed("cam", feed.generation, "watchdog")
-    assert runtime._fatal_error is not None
-    # The retries before the escalation are fine; none after it.
-    assert scheduled and len(scheduled) < WallRuntime.SHORT_GENERATION_LIMIT * 2
-
-
-def test_one_generation_after_the_rebuild_restarts_the_wall() -> None:
-    # The rebuild ran before this generation started, so this generation is
-    # the test of it. Two more would repeat the same question at 30s a turn.
-    rebuilt: list[str] = []
-    runtime = _wedging_runtime(rebuilt)
-    feed = _lifetime_feed()
-    _wedge(runtime, feed)
-    assert rebuilt == ["cam"] and runtime._fatal_error is None
-    feed.healthy_at = time.monotonic()
-    runtime._note_generation_lifetime(feed)
-    assert runtime._fatal_error is not None
-    # And no second rebuild was attempted on the way there.
-    assert rebuilt == ["cam"]
-
-
-def test_a_feed_that_recovers_after_the_rebuild_starts_the_ladder_over() -> None:
-    # The cooldown is "did it actually work", not a timer: one generation
-    # outliving the threshold clears the rebuild flag, so a fault minutes later
-    # begins at reconnect again rather than jumping to the restart.
-    rebuilt: list[str] = []
-    runtime = _wedging_runtime(rebuilt)
-    feed = _lifetime_feed()
-    _wedge(runtime, feed)
-    feed.state = "healthy"
-    runtime.feeds = {"cam": feed}
-    runtime._mark_feed_stable("cam", feed.generation)
-    assert not feed.branches_rebuilt
-    # A fresh episode gets the full three reconnects before rebuilding again.
-    feed.healthy_at = time.monotonic()
-    runtime._note_generation_lifetime(feed)
-    assert runtime._fatal_error is None
-    assert rebuilt == ["cam"]
-    _wedge(runtime, feed, times=WallRuntime.SHORT_GENERATION_LIMIT - 1)
-    assert rebuilt == ["cam", "cam"]
-    assert runtime._fatal_error is None
-
-
-def test_a_camera_that_is_off_never_restarts_the_wall() -> None:
-    # The property the restart depends on: a feed that never reaches healthy
-    # cannot advance the wedge counter, so an outage of any length -- a camera
-    # powered down, a switch pulled -- retries forever without taking the wall
-    # with it. Measured on real hardware: a switch cut for several minutes
-    # produced no escalation at all.
-    rebuilt: list[str] = []
-    runtime = _wedging_runtime(rebuilt)
-    feed = _lifetime_feed()
-    for _ in range(WallRuntime.SHORT_GENERATION_LIMIT * 10):
-        feed.healthy_at = None
-        runtime._note_generation_lifetime(feed)
-    assert runtime._fatal_error is None
-    assert rebuilt == []
-    assert feed.short_lived_generations == 0
-
-
-def test_a_rebuild_that_worked_says_so(caplog) -> None:
-    # Recovery is declared by the stable marker, not by one generation
-    # outliving the short threshold: a feed limping just past it would
-    # otherwise reset the ladder forever and never escalate.
-    rebuilt: list[str] = []
-    runtime = _wedging_runtime(rebuilt)
-    feed = _lifetime_feed()
-    _wedge(runtime, feed)
-    feed.state = "healthy"
-    runtime.feeds = {"cam": feed}
-    with caplog.at_level("WARNING"):
-        runtime._mark_feed_stable("cam", feed.generation)
-    assert "the rebuild cleared the wedge" in caplog.text
-    assert not feed.branches_rebuilt
-
-
-def test_outliving_the_short_threshold_is_not_yet_recovery() -> None:
-    # A generation longer than SHORT_GENERATION_SECONDS stops counting against
-    # the feed, but the rebuild flag survives until FEED_STABLE_SECONDS.
-    rebuilt: list[str] = []
-    runtime = _wedging_runtime(rebuilt)
-    feed = _lifetime_feed()
-    _wedge(runtime, feed)
-    feed.healthy_at = time.monotonic() - WallRuntime.SHORT_GENERATION_SECONDS - 1
-    runtime._note_generation_lifetime(feed)
-    assert feed.short_lived_generations == 0
-    assert feed.branches_rebuilt
-
-
-def test_one_short_generation_is_not_enough(caplog) -> None:
-    runtime = object.__new__(WallRuntime)
-    feed = _lifetime_feed()
-    feed.healthy_at = time.monotonic()
-    with caplog.at_level("ERROR"):
-        runtime._note_generation_lifetime(feed)
-    assert "died within" not in caplog.text
-
-
-def test_a_feed_that_ran_a_while_resets_the_run(caplog) -> None:
-    # A long generation means the feed worked; what came before is history.
-    runtime = object.__new__(WallRuntime)
-    feed = _lifetime_feed()
-    feed.healthy_at = time.monotonic()
-    runtime._note_generation_lifetime(feed)
-    feed.healthy_at = time.monotonic() - WallRuntime.SHORT_GENERATION_SECONDS - 1
-    runtime._note_generation_lifetime(feed)
-    assert feed.short_lived_generations == 0
-    feed.healthy_at = time.monotonic()
-    with caplog.at_level("ERROR"):
-        runtime._note_generation_lifetime(feed)
-    assert "died within" not in caplog.text
 
 
 def _branch_viewport(index: int, feeds: tuple[str, ...], active: str | None):

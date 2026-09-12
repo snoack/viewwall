@@ -82,8 +82,9 @@ class FeedRuntime:
     max_frame_gap: float | None = None
     decoded_frames: int = 0
     healthy_at: float | None = None
-    short_lived_generations: int = 0
     branches_rebuilt: bool = False
+    # When this feed last took the wall down, so a repeat cannot loop on it.
+    fatal_at: float | None = None
     observed_fps_applied: bool = False
     caps_fps_known: bool = False
     watchdog_reported: bool = False
@@ -142,9 +143,6 @@ class WallRuntime:
     # A generation that reached healthy and died inside this many seconds
     # delivered almost nothing: the feed connected but no video followed.
     SHORT_GENERATION_SECONDS = 15.0
-    # Consecutive such generations before saying so. One is a coincidence --
-    # a camera can drop just after connecting -- and a run of them is not.
-    SHORT_GENERATION_LIMIT = 3
 
     STALL_FRAMES = 45
     # A generation gets this long to link a video pad before it is restarted.
@@ -159,6 +157,12 @@ class WallRuntime:
     # restarted by hand. Measured connects on this wall take 1-2s, so 30
     # leaves a wide margin over a slow camera while still bounding the hang.
     FEED_CONNECT_SECONDS = 30
+    # How long a wall restart is given to prove itself before the same feed is
+    # allowed to ask for another. A camera whose encoder freezes while its TCP
+    # session stays up starves the stall watchdog exactly like shared state
+    # does, and no number of restarts fixes the camera; without this it would
+    # take the wall down on every episode.
+    FATAL_COOLDOWN_SECONDS = 600.0
     MIN_STALL_TIMEOUT_MS = 5_000
     FEED_STALL_TIMEOUT_MS = 15_000
     FEED_STABLE_SECONDS = 60
@@ -740,10 +744,14 @@ class WallRuntime:
         )
         LOG.info("feed %s: retrying in %.1f seconds", feed.config.name, delay)
 
-    def _request_feed_restart(self, feed_name: str, generation: int, reason: str) -> None:
-        self.GLib.idle_add(self._restart_feed, feed_name, generation, reason)
+    def _request_feed_restart(
+        self, feed_name: str, generation: int, reason: str, stalled: bool = False
+    ) -> None:
+        self.GLib.idle_add(self._restart_feed, feed_name, generation, reason, stalled)
 
-    def _restart_feed(self, feed_name: str, generation: int, reason: str) -> bool:
+    def _restart_feed(
+        self, feed_name: str, generation: int, reason: str, stalled: bool = False
+    ) -> bool:
         if self._stopping:
             return False
         feed = self.feeds[feed_name]
@@ -761,7 +769,7 @@ class WallRuntime:
         # After the teardown, never before: rebuilding a branch releases the
         # tee pad it is fed from, and a source still running into a tee with
         # no branches left errors out with "not-linked" on the spot.
-        self._note_generation_lifetime(feed)
+        self._note_generation_lifetime(feed, reason, stalled)
         if self._stopping:
             # The wedge escalated to a restart; the wall is on its way down and
             # a retry scheduled now would outlive the pipeline it targets.
@@ -769,77 +777,103 @@ class WallRuntime:
         self._schedule_feed_retry(feed)
         return False
 
-    def _note_generation_lifetime(self, feed: FeedRuntime) -> None:
-        """Say so when a feed keeps dying immediately after connecting.
+    def _note_generation_lifetime(
+        self, feed: FeedRuntime, reason: str, stalled: bool
+    ) -> None:
+        """Repair a feed that keeps dying moments after it starts delivering.
 
         A feed is called healthy on its first buffer, so one frame followed by
         silence reads in the log exactly like a feed that ran well and then
-        broke -- the same "video is healthy" line, once per generation. Told
-        apart only by noticing that the healthy lines repeat every few seconds,
-        which is not something the log says anywhere.
+        broke. Told apart only by noticing that the healthy lines repeat every
+        few seconds, which is not something the log says anywhere.
 
-        The two have different causes and different fixes. A feed that runs and
-        later fails is the camera or the network, and retrying is the answer. A
-        feed that dies this fast every time got its stream and could not keep
-        it, which on this wall has meant the pipeline downstream of the feed
-        bin -- preserved across restarts, and never flushed -- holding state
-        from the generation before. Retrying cannot clear that, so a feed that
-        keeps this up past a branch rebuild takes the whole wall down and lets
-        the service manager start it again.
+        Three facts decide what to do, and all three are already known without
+        measuring anything about the stream:
 
-        Only a generation that reached healthy counts. A camera that is off,
-        or behind a switch that is, never gets there, so an outage of any
-        length cannot walk a feed into the restart: it fails without ever
-        reaching the healthy line this measures from.
+        Did it ever deliver? A camera that is off, or behind a switch that is,
+        never reaches healthy, so an outage of any length is a reconnect and
+        nothing more. This is the guard that keeps a dark camera from ever
+        walking the wall into a restart.
+
+        Did it die quickly? A generation that ran longer than
+        SHORT_GENERATION_SECONDS was working; whatever ended it is the ordinary
+        transient the retry backoff exists for.
+
+        Did the source complain, or did the sink starve? An rtspsrc error or an
+        EOS means the camera went away, which nothing downstream can cause and
+        no repair here can fix. A stall watchdog firing while the source was
+        still connected means frames entered the wall and no video followed,
+        which is the only failure a rebuild addresses.
+
+        An earlier version counted consecutive failures and read RTP packet
+        counters to guess at this last question. It twice read a real wedge as
+        an outage in production and escalated nothing, because the counters
+        were sampled after the stream had already stopped. The reason a feed
+        was restarted answers the same question exactly, and costs nothing.
         """
         healthy_at = feed.healthy_at
         if healthy_at is None:
-            # Never reached healthy: no stream at all, which the ordinary
+            # Never delivered a frame: no stream at all, which the ordinary
             # restart line already describes.
-            feed.short_lived_generations = 0
             return
         lifetime = time.monotonic() - healthy_at
         if lifetime > self.SHORT_GENERATION_SECONDS:
             # Long enough not to count against the feed, but not the same as
             # recovered: _mark_feed_stable() clears the rebuild flag, on the
             # same FEED_STABLE_SECONDS the retry backoff already treats as
-            # proof a feed is healthy. Calling it here instead would let a feed
-            # limping at sixteen second intervals reset the ladder every time
-            # and never escalate at all.
-            feed.short_lived_generations = 0
+            # proof a feed is well. Clearing it here would let a feed limping
+            # at sixteen second intervals reset the run every time.
             return
-        feed.short_lived_generations += 1
-        limit = 1 if feed.branches_rebuilt else self.SHORT_GENERATION_LIMIT
-        if feed.short_lived_generations < limit:
-            return
-        if not feed.branches_rebuilt:
-            # Reported once per run of failures rather than on every attempt:
-            # the condition persists, and repeating it every 30s buries the log
-            # the way the warning it replaces already did. The post-rebuild
-            # case says its own piece below.
-            LOG.error(
-                "feed %s: connected and died within %.1fs on %d consecutive "
-                "attempts; the stream reaches the wall but no video follows it. "
-                "Retrying alone does not clear this",
+        if not stalled:
+            # The camera stopped sending. Rebuilding the branch it was feeding
+            # cannot change that, and on a rotating viewport the rebuild
+            # disturbs the other feed sharing it, so a flaky camera would pay
+            # that cost on every drop for no benefit.
+            LOG.info(
+                "feed %s: died in %.1fs after %s, which is the source rather "
+                "than this wall; reconnecting",
                 feed.config.name,
                 lifetime,
-                feed.short_lived_generations,
+                reason,
             )
-        feed.short_lived_generations = 0
+            return
         if feed.branches_rebuilt:
-            # One short generation is the whole answer here: the rebuild ran
-            # before it started, so it has already been tested, and waiting for
-            # two more asks the same question at 30s a turn. The state is
-            # outside the branch, and nothing this process can reach clears it,
-            # so hand it to the service manager -- a few seconds of black wall
-            # in place of one tile black indefinitely.
+            # The rebuild ran before this generation started, so it has already
+            # been tested. The state is outside the branch and nothing this
+            # process can reach clears it, so hand the wall to the service
+            # manager -- unless this feed has just done that, in which case the
+            # restart plainly did not help and doing it again only costs every
+            # other viewport.
+            if self._restart_is_on_cooldown(feed):
+                LOG.error(
+                    "feed %s: still failing after a branch rebuild and a wall "
+                    "restart %.0fs ago, so restarting again would not clear it "
+                    "either; leaving this feed to reconnect on its own",
+                    feed.config.name,
+                    time.monotonic() - (feed.fatal_at or 0.0),
+                )
+                return
+            feed.fatal_at = time.monotonic()
             self._fatal(
                 f"feed {feed.config.name}: still wedging after a branch "
                 "rebuild, so the stale state is outside the branch. Restarting "
                 "the wall is the only thing left that clears it"
             )
             return
+        LOG.error(
+            "feed %s: connected and died within %.1fs after %s; the stream "
+            "reaches the wall but no video follows it. Rebuilding its branch",
+            feed.config.name,
+            lifetime,
+            reason,
+        )
         feed.branches_rebuilt = self._rebuild_feed_branches(feed)
+
+    def _restart_is_on_cooldown(self, feed: FeedRuntime) -> bool:
+        last = feed.fatal_at
+        if last is None:
+            return False
+        return time.monotonic() - last < self.FATAL_COOLDOWN_SECONDS
 
     def _rebuild_feed_branches(self, feed: FeedRuntime) -> bool:
         """Recreate one feed's branch elements, leaving every other feed alone.
@@ -1067,7 +1101,6 @@ class WallRuntime:
                 )
                 feed.branches_rebuilt = False
             feed.failures = 0
-            feed.short_lived_generations = 0
             feed.stable_source_id = None
         return False
 
@@ -1793,9 +1826,15 @@ class WallRuntime:
                     return
                 self._fatal(f"GStreamer error from {source_name}: {error.message}")
             else:
+                # The stall watchdog is the one error that does not name a
+                # cause: it fires on the absence of decoded frames, whatever
+                # stopped them. The recovery path reads that distinction, so
+                # mark it here rather than matching on the message later.
+                stalled = source_name.startswith("watchdog_")
                 self._request_feed_restart(
                     *identity,
                     f"error from {source_name}: {error.message}",
+                    stalled=stalled,
                 )
         elif message.type == self.Gst.MessageType.ELEMENT:
             structure = message.get_structure()

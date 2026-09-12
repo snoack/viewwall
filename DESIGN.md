@@ -119,38 +119,41 @@ generations deep, while the other eight viewports ran normally. Retrying does
 not clear it, because the state that is wedged is not in the part a retry
 replaces.
 
-Three consecutive generations that reach healthy and die within fifteen
-seconds escalate. The first response rebuilds that feed's branch queue and
-videocrop -- the only elements a feed restart does not already replace. One
-more short generation after that ends it: the wall fails and the service
-manager starts it again. Several seconds of black wall replaces one viewport
-black indefinitely.
+What happens next is decided by three facts already known when a generation
+ends, without measuring anything about the stream.
 
-The post-rebuild threshold is one generation rather than three because the
-rebuild has already been tested by the time that generation dies -- it ran
-before the generation started. Waiting for two more asks the same question
-under the same conditions, and they are the expensive ones: the retry backoff
-has reached 30s by then, so they add a minute of black tile and no
-information. Reconnect, reconnect, reconnect, rebuild, restart takes about
-28 seconds end to end.
+**Did it ever deliver a frame?** A camera that is off, or behind a switch that
+is, never reaches the healthy line above, so an outage of any length is a
+reconnect and nothing more. Verified on hardware by
+power cycling the switch feeding three cameras: minutes down, no escalation,
+clean recovery.
 
-The ladder is per episode rather than per process: a feed that recovers and
-fails again an hour later starts at the first reconnect, not at the rebuild.
-Two different thresholds decide that, because the questions differ. Fifteen
-seconds is enough for a generation to stop counting against the feed, but
-recovery is only declared once the feed has been healthy for
-`FEED_STABLE_SECONDS` -- the same interval the retry backoff already treats as
-proof a feed is well. A single threshold would mean a feed limping at sixteen
-second intervals reset the ladder on every generation and never escalated at
-all. The counters live on the feed, so one camera's history never pushes
-another up the ladder.
+**Did it die quickly?** A generation outliving `SHORT_GENERATION_SECONDS` was
+working, and whatever ended it is the transient the retry backoff exists for.
 
-Only a generation that reached healthy counts toward this. A camera that is
-powered down, or behind a switch that is, never gets there: it fails before
-the healthy line the measurement starts from, so an outage of any length
-retries forever without restarting the wall. Verified on hardware by cutting
-the switch feeding three cameras -- several minutes down, no escalation, and
-a clean recovery when it came back.
+**Did the source complain, or did the sink starve?** An `rtspsrc` error or an
+EOS means the camera went away, which nothing downstream can cause and no
+repair here can fix. The stall watchdog is the one error that names no cause:
+it fires on the absence of decoded frames, so frames entered the wall and no
+video followed. Only that case is repaired.
+
+A generation that delivered, died inside fifteen seconds, and starved the
+watchdog has its branch queue and videocrop rebuilt -- the only elements a
+feed restart does not already replace. One more such generation ends it: the
+wall fails and the service manager starts it again, several seconds of black
+wall in place of one viewport black indefinitely. A feed that has just taken
+the wall down is not allowed to do it again for `FATAL_COOLDOWN_SECONDS`,
+because a camera whose encoder freezes while its TCP session stays up starves
+the watchdog exactly like shared state does, and no number of restarts fixes
+the camera.
+
+An earlier version counted consecutive short generations and read RTP packet
+counters to answer the third question. It twice read a real wedge as an outage
+in production and escalated nothing: the counters were sampled on a timer, and
+a feed that delivers a burst and stops has already stopped by the time two
+samples bracket it, so every interval looked quiet. The reason the feed was
+restarted answers the same question exactly, costs nothing, and cannot be
+sampled at the wrong moment.
 
 The unit never gives up on the restart (`StartLimitIntervalSec=0`). A stopped
 wall shows nothing, while one that keeps restarting still shows every healthy
