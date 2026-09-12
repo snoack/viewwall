@@ -1,3 +1,34 @@
+viewwall (0.1.4-1) unstable; urgency=medium
+
+  * Decide a feed's repair from why it failed rather than from RTP packet
+    counts. The previous test sampled counters on a timer and twice read a
+    real wedge as an outage in production, escalating nothing while a tile
+    stayed dark: a feed that delivers a burst and stops has already stopped
+    by the time two samples bracket it. A feed that delivered video, died
+    within fifteen seconds and starved the stall watchdog now has its branch
+    rebuilt at once, and the wall restarts if that does not clear it. A
+    camera that never delivered a frame is still only reconnected, so an
+    outage cannot trigger either however long it lasts.
+  * Rebuild the branch behind a viewport that stops showing video while its
+    feed keeps delivering. Every other failure signal sits inside the feed
+    bin, upstream of the branch, so this failure previously blacked a tile
+    indefinitely with nothing logged.
+  * Restart a feed that connects but never links video. After a switch was
+    power cycled, an NVR closed its side of a connection and left the socket
+    in CLOSE-WAIT; rtspsrc read nothing, never reached its own timeout, and
+    the feed sat silent for twenty-five minutes with no watchdog, no retry
+    and no escalation. Each generation now gets thirty seconds to deliver a
+    video pad before it is replaced.
+  * Set the log level in the configuration file with "log_level", so raising
+    it no longer needs a systemd drop-in. The command line still wins.
+  * Log how long a rotating viewport takes to change feeds, and how much
+    video its output queue still held at the switch.
+  * Share the DRM descriptor between KMS sinks rather than duplicating it.
+    Every sink replacement leaked one, and a sink is replaced on every feed
+    outage.
+
+ -- Sebastian Noack <sebastian.noack@gmail.com>  Sat, 12 Sep 2026 13:30:00 -0400
+
 viewwall (0.1.3-1) unstable; urgency=medium
 
   * Restart the wall when a feed stays wedged. A feed that connects, reports
