@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 import sys
 
-from .config import AppConfig, ConfigError, load_config
+from .config import LOG_LEVELS, AppConfig, ConfigError, load_config
 from .display import DisplayError, detect_displays
 from .gst_runtime import RuntimeDependencyError, WallRuntime
 from .journal import install as install_logging
@@ -21,7 +21,7 @@ def _parser() -> argparse.ArgumentParser:
         default=Path("/etc/viewwall/viewwall.toml"),
         help="configuration file (default: /etc/viewwall/viewwall.toml)",
     )
-    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
+    parser.add_argument("--log-level", choices=LOG_LEVELS)
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("run", help="run the camera wall")
     subparsers.add_parser("validate", help="validate configuration without opening DRM")
@@ -69,12 +69,16 @@ def _print_layout(config: AppConfig, width: int | None, height: int | None) -> N
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     install_logging(
-        getattr(logging, args.log_level),
+        getattr(logging, args.log_level or "INFO"),
         "%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     command = args.command or "run"
     try:
         config = load_config(args.config)
+        # Not sooner: logging has to be up before this line so a config file
+        # that will not parse can say so. The flag still wins.
+        if args.log_level is None and config.log_level is not None:
+            logging.getLogger().setLevel(getattr(logging, config.log_level))
         if command == "validate":
             displays = len(config.displays)
             suffix = "" if displays == 1 else f", {displays} displays"

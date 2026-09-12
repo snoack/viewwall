@@ -213,6 +213,25 @@ def test_metrics_are_on_by_default(tmp_path: Path) -> None:
     assert metrics.enabled is True
 
 
+def test_log_level_defaults_to_unset(tmp_path: Path) -> None:
+    # None rather than "INFO": the flag has to stay in charge of the level it
+    # already installed before the file was read.
+    assert _metrics_config(tmp_path).log_level is None
+
+
+def test_log_level_is_configurable(tmp_path: Path) -> None:
+    assert _metrics_config(tmp_path, 'log_level = "DEBUG"').log_level == "DEBUG"
+
+
+def test_log_level_is_case_insensitive(tmp_path: Path) -> None:
+    assert _metrics_config(tmp_path, 'log_level = "debug"').log_level == "DEBUG"
+
+
+def test_unknown_log_level_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="log_level"):
+        _metrics_config(tmp_path, 'log_level = "LOUD"')
+
+
 def test_metrics_interval_is_configurable(tmp_path: Path) -> None:
     config = _metrics_config(tmp_path, "[metrics]\ninterval_seconds = 10")
     assert config.metrics.interval_seconds == 10.0

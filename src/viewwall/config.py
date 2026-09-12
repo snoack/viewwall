@@ -249,6 +249,7 @@ class ViewportConfig:
 class AppConfig:
     drm: DrmConfig
     displays: tuple[DisplayConfig, ...]
+    log_level: str | None
     metrics: MetricsConfig
     feed_defaults: FeedDefaults
     feeds: dict[str, FeedConfig]
@@ -396,12 +397,15 @@ _TOP_LEVEL_KEYS = frozenset(
         "drm",
         "displays",
         "display_defaults",
+        "log_level",
         "metrics",
         "feed_defaults",
         "feeds",
         "viewports",
     }
 )
+
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
 def load_config(path: str | Path, environ: Mapping[str, str] | None = None) -> AppConfig:
@@ -421,6 +425,13 @@ def load_config(path: str | Path, environ: Mapping[str, str] | None = None) -> A
     display_defaults_raw = _mapping(
         raw.get("display_defaults"), "display_defaults", _DISPLAY_DEFAULT_KEYS
     )
+    log_level = raw.get("log_level")
+    if log_level is not None:
+        if not isinstance(log_level, str) or log_level.upper() not in LOG_LEVELS:
+            raise ConfigError(
+                f"log_level must be one of {', '.join(LOG_LEVELS)}"
+            )
+        log_level = log_level.upper()
     metrics_raw = _mapping(raw.get("metrics"), "metrics", _METRICS_KEYS)
     defaults_raw = _mapping(raw.get("feed_defaults"), "feed_defaults", _FEED_DEFAULT_KEYS)
 
@@ -633,6 +644,7 @@ def load_config(path: str | Path, environ: Mapping[str, str] | None = None) -> A
     return AppConfig(
         drm=drm,
         displays=displays,
+        log_level=log_level,
         metrics=metrics,
         feed_defaults=defaults,
         feeds=feeds,

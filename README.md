@@ -251,6 +251,19 @@ To change the interval, or turn it off:
 interval_seconds = 60   # 0 disables
 ```
 
+### Log level
+
+`log_level` sets how much the wall says, as a top-level key:
+
+```toml
+log_level = "DEBUG"   # DEBUG, INFO, WARNING or ERROR; default INFO
+```
+
+`--log-level` overrides it, so a level can be forced without editing the file.
+`DEBUG` adds per-event detail -- crop and aspect decisions, GStreamer error
+detail, and the numbers behind each feed-recovery verdict. Nothing at that
+level runs per frame, so it costs little beyond journal volume.
+
 ### RTSP and RTSPS
 
 Feeds use `rtsp://` over TCP by default (`feed_defaults.transport = "tcp"`).
