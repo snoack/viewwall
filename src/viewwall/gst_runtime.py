@@ -310,7 +310,12 @@ class WallRuntime:
         self, safe_name: str, plane_id: int, connector_id: int, generation: int
     ) -> Any:
         sink = self._element("kmssink", f"kms_{safe_name}_{generation}")
-        sink.set_property("fd", os.dup(self.drm_fd))
+        # The one open descriptor, shared rather than duplicated. kmssink keeps
+        # an is_internal_fd flag and closes the fd only when it opened it
+        # itself, so an externally supplied one is read and never closed --
+        # which made a dup per sink a descriptor leaked on every replacement,
+        # and _show_viewport_offline() replaces a sink on every feed outage.
+        sink.set_property("fd", self.drm_fd)
         sink.set_property("plane-id", plane_id)
         sink.set_property("connector-id", connector_id)
         self._set_if_present(sink, "force-aspect-ratio", False)
@@ -394,7 +399,7 @@ class WallRuntime:
                     "display %s: background unavailable: %s", display_name, exc
                 )
                 continue
-            sink.set_property("fd", os.dup(self.drm_fd))
+            sink.set_property("fd", self.drm_fd)
             sink.set_property("connector-id", state.connector_id)
             self._set_if_present(sink, "force-modesetting", True)
             # The CRTC goes back to the console's framebuffer when the DRM fd
@@ -1286,9 +1291,12 @@ class WallRuntime:
         was_active = viewport.active_feed is not None
         viewport.valve.set_property("drop", True)
         if was_active:
-            # kmssink closes and invalidates an externally supplied fd when it
-            # enters NULL. Replace that spent instance so a recovered feed can
-            # reuse the plane without reconstructing the complete pipeline.
+            # A kmssink cannot be restarted once it has been to NULL: it
+            # fails the next PLAYING with "Could not open DRM module".
+            # Replace the spent instance so a recovered feed can reuse the
+            # plane without reconstructing the complete pipeline. The fd it
+            # was given outlives it -- kmssink only closes fds it opened
+            # itself -- so the replacement shares the same one.
             try:
                 self._replace_viewport_sink(viewport)
             except RuntimeDependencyError as exc:
