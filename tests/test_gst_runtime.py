@@ -832,6 +832,30 @@ def test_compositor_background_does_not_pin_a_framerate() -> None:
     assert "framerate" not in bg_caps.props["caps"]
 
 
+def test_audio_streams_are_refused_before_setup() -> None:
+    """A wall shows pictures; audio is work with no consumer.
+
+    Refusing the stream in select-stream is upstream of the transport, so
+    rtspsrc never sends a SETUP for it -- unlike the queue+fakesink this
+    replaced, which received and depayloaded audio only to drop it.
+    """
+    runtime = object.__new__(WallRuntime)
+
+    def caps_for(media):
+        return SimpleNamespace(
+            get_size=lambda: 1,
+            get_structure=lambda _i: SimpleNamespace(
+                get_string=lambda _k: media
+            ),
+        )
+
+    assert runtime._select_rtsp_stream(None, 0, caps_for("audio")) is False
+    assert runtime._select_rtsp_stream(None, 0, caps_for("video")) is True
+    # An unusual SDP must not cost a feed its video.
+    assert runtime._select_rtsp_stream(None, 0, caps_for(None)) is True
+    assert runtime._select_rtsp_stream(None, 0, None) is True
+
+
 def test_compositor_forces_square_pixels() -> None:
     """A camera's PAR has nothing to say once pad geometry places the source.
 

@@ -73,7 +73,6 @@ class FeedRuntime:
     tee: Any
     bin: Any | None = None
     source: Any | None = None
-    audio_queue: Any | None = None
     watchdog: Any | None = None
     depay: Any | None = None
     parser: Any | None = None
@@ -94,7 +93,6 @@ class FeedRuntime:
     caps_fps_known: bool = False
     watchdog_reported: bool = False
     video_linked: bool = False
-    audio_linked: bool = False
     generation: int = 0
     state: str = "stopped"
     failures: int = 0
@@ -936,9 +934,11 @@ class WallRuntime:
             raise RuntimeDependencyError(f"could not create bin for feed {feed.config.name}")
 
         source = self._element("rtspsrc", f"rtsp_{safe}")
-        audio_queue = self._element("queue", f"audio_queue_{safe}")
-        audio_sink = self._element("fakesink", f"audio_sink_{safe}")
         watchdog = self._element("watchdog", f"watchdog_{safe}")
+        # Refuse audio before rtspsrc sets it up: returning FALSE skips the
+        # stream entirely, where the queue and fakesink this replaces still
+        # paid for the transport and depayloading of audio nothing wanted.
+        source.connect("select-stream", self._select_rtsp_stream)
 
         source.set_property("location", feed.config.uri)
         source.set_property("latency", feed.config.latency_ms)
@@ -962,21 +962,14 @@ class WallRuntime:
             source, "protocols", TRANSPORTS[feed.config.transport]
         )
 
-        audio_queue.set_property("max-size-buffers", 4)
-        audio_queue.set_property("max-size-bytes", 0)
-        audio_queue.set_property("max-size-time", 0)
-        self.Gst.util_set_object_arg(audio_queue, "leaky", "downstream")
-        audio_sink.set_property("sync", False)
-        audio_sink.set_property("async", False)
         # A starting value only. Once the feed negotiates caps its real
         # framerate is known, and _apply_feed_watchdog() scales this to suit it:
         # a fixed timeout that is right for 30fps is far too tight for a 3fps
         # camera, which can legitimately go seconds between frames.
         watchdog.set_property("timeout", self.FEED_STALL_TIMEOUT_MS)
 
-        for element in (source, audio_queue, audio_sink, watchdog):
+        for element in (source, watchdog):
             feed_bin.add(element)
-        self._link_many(audio_queue, audio_sink)
 
         ghost = self.Gst.GhostPad.new("video", watchdog.get_static_pad("src"))
         if ghost is None or not feed_bin.add_pad(ghost):
@@ -1003,7 +996,6 @@ class WallRuntime:
 
         feed.bin = feed_bin
         feed.source = source
-        feed.audio_queue = audio_queue
         feed.watchdog = watchdog
         feed.depay = None
         feed.parser = None
@@ -1018,7 +1010,6 @@ class WallRuntime:
         feed.watchdog_reported = False
         feed.decoded_frames = 0
         feed.video_linked = False
-        feed.audio_linked = False
         feed.state = "starting"
         self._feed_bins[feed_bin.get_name()] = (feed.config.name, generation)
 
@@ -1066,7 +1057,6 @@ class WallRuntime:
             self.GLib.timeout_add_seconds(30, self._forget_feed_bin, bin_name)
         feed.bin = None
         feed.source = None
-        feed.audio_queue = None
         feed.watchdog = None
         feed.depay = None
         feed.parser = None
@@ -1074,7 +1064,6 @@ class WallRuntime:
         feed.codec = None
         feed.source_size = None
         feed.video_linked = False
-        feed.audio_linked = False
 
     def _forget_feed_bin(self, bin_name: str) -> bool:
         self._feed_bins.pop(bin_name, None)
@@ -1994,6 +1983,17 @@ class WallRuntime:
                 decoder_factory,
             )
 
+    def _select_rtsp_stream(self, _source: Any, _num: int, caps: Any) -> bool:
+        """Set up only the video stream of an RTSP session.
+
+        Anything not recognisably audio is accepted, so an unusual SDP cannot
+        silently cost a feed its video.
+        """
+        if caps is None or caps.get_size() == 0:
+            return True
+        media = (caps.get_structure(0).get_string("media") or "").lower()
+        return media != "audio"
+
     def _on_rtsp_pad(
         self,
         source: Any,
@@ -2070,11 +2070,6 @@ class WallRuntime:
                     result.value_nick,
                 )
                 self._request_feed_restart(feed_name, generation, "RTP pad link failure")
-        elif media == "audio" and not feed.audio_linked:
-            result = pad.link(feed.audio_queue.get_static_pad("sink"))
-            if result == self.Gst.PadLinkReturn.OK:
-                feed.audio_linked = True
-                LOG.debug("feed %s: audio is being discarded", feed.config.name)
 
     def _apply_viewport_crop(self, viewport: ViewportRuntime) -> None:
         if viewport.resolved is None:

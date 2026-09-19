@@ -47,7 +47,7 @@ H.265 is an option only on a Pi 4 (hardware HEVC) or a Pi 5.
 
 ```text
 UniFi Protect RTSP
-  -> rtspsrc (video selected explicitly; audio discarded)
+  -> rtspsrc (audio refused in select-stream, before it is set up)
   -> codec detected from the RTSP SDP
   -> rtph264depay / h264parse / v4l2h264dec
      or rtph265depay / h265parse / v4l2slh265dec
