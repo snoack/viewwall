@@ -1478,12 +1478,15 @@ class WallRuntime:
             # pair of numbers says whether that is what happened.
             viewport.switched_at = now
             depth = self._queue_delay_ms(viewport.output_queue)
+            held = self._queue_level_buffers(viewport.output_queue)
             LOG.info(
-                "viewport %d: switching from %s to %s with %s of video queued",
+                "viewport %d: switching from %s to %s with %s of video queued "
+                "in %s buffers",
                 viewport.config.index,
                 previous_feed,
                 feed_name,
                 "unknown depth" if depth is None else f"{depth:.0f}ms",
+                "?" if held is None else held,
             )
         # Frames counted before the switch came from the previous feed. Left
         # in place they would be averaged with the new one's, and a viewport
@@ -2118,6 +2121,23 @@ class WallRuntime:
         except (TypeError, AttributeError):
             return None
         return level_ns / 1_000_000.0
+
+    def _queue_level_buffers(self, queue: Any) -> int | None:
+        """How many buffers are waiting in a queue.
+
+        The companion to _queue_delay_ms, and the one that answers whether a
+        switch is slow because the queue is full. The millisecond figure is
+        current-level-time, which on a queue bounded by buffer count is just
+        that count divided by the feed's rate: it reads about 1067ms at 30fps
+        and 1333ms at 24fps whatever is actually happening, so it cannot tell
+        a full queue from an empty one. The buffer count can.
+        """
+        if queue is None:
+            return None
+        try:
+            return int(queue.get_property("current-level-buffers"))
+        except (TypeError, AttributeError, ValueError):
+            return None
 
     def _sink_presented(self, sink: Any) -> tuple[int, int] | None:
         """Frames the sink has put on screen, and frames it threw away.

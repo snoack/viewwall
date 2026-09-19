@@ -998,6 +998,27 @@ def test_a_declared_framerate_beats_measurement() -> None:
 
 
 
+
+def test_queue_level_reports_the_buffer_count() -> None:
+    # The decisive number when a rotating viewport is slow to change picture.
+    # current-level-time on a buffer-bounded queue is just the count divided
+    # by the feed rate, so it reads about the same whether the queue is full
+    # or empty; the count itself does not.
+    runtime = object.__new__(WallRuntime)
+    queue = SimpleNamespace(
+        get_property=lambda prop: 32 if prop == "current-level-buffers" else None
+    )
+    assert runtime._queue_level_buffers(queue) == 32
+
+
+
+def test_queue_level_is_absent_when_the_queue_cannot_say() -> None:
+    runtime = object.__new__(WallRuntime)
+    assert runtime._queue_level_buffers(None) is None
+    unreadable = SimpleNamespace(get_property=lambda prop: None)
+    assert runtime._queue_level_buffers(unreadable) is None
+
+
 def _metrics_runtime(queue_ns: int | None = 45_000_000) -> WallRuntime:
     runtime = object.__new__(WallRuntime)
     runtime._stopping = False
