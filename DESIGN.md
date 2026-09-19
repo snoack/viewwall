@@ -481,6 +481,35 @@ Recorded so they are not re-attempted:
   segfaults exporting a dmabuf from a `glvideomixer`. CPU `compositor` is the
   mixer that shipped instead, as an opt-in backend rather than as the default.
 - **Software HEVC decoding.** See the design constraints above.
+- **A scaler in front of the sink**, to reshape a camera whose aspect does not
+  match its tile -- the 480x360 doorbell among 640x360 feeds -- instead of
+  stretching it with a pixel aspect ratio. It cannot work on a Pi 3, and is
+  not worth having anywhere else:
+  - `videocrop` will not renegotiate once it has seen DMA_DRM caps from a
+    hardware decoder. The size a scaler has to target is only known when the
+    feed's caps arrive, which is after the pipeline is PLAYING, so the target
+    always lands too late. Measured with the same chain either side: a late
+    retarget passed 0 buffers on a Pi 3 behind `v4l2h264dec` and 12262 on a
+    Pi 5 behind `avdec_h264`. Rebuilding the branch does not escape it,
+    because the rebuilt branch still negotiates against a live decoder.
+  - The hardware is the wrong way round. `v4l2convert` exists only on a Pi 3
+    and Pi 4, where the hardware decoder blocks it; a Pi 5 has no hardware
+    converter at all, only `videoscale`. And `videoscale` behind a hardware
+    decoder pulls every DMA-BUF frame back into system memory: nine feeds
+    measured 399% of a Pi 3 core that way against 82% through `v4l2convert`.
+  - Where it does work it buys nothing. Pre-scaling a feed that already
+    shares its tile's shape costs 10 points of a Pi 3 core per feed and 3.5
+    of a Pi 5's, because the scaling it replaces is free -- the HVS does it
+    during scanout under kms-planes, and the compositor's pad does it while
+    blending. On the compositor an aspect-mismatched feed measured 59.3%
+    against 57.6% without, which is inside the noise.
+- **The compositor backend on a Pi 3 with a seam.** `videocrop` needs a zero
+  crop, a crop meta from downstream, or raw caps. `compositor` advertises only
+  `GST_VIDEO_META_API_TYPE` and never a crop meta, and a Pi 3's hardware
+  decoder produces DMA_DRM rather than raw, so all three fail together and
+  every seamed viewport dies at startup with "Dowstream doesn't support crop
+  for non-raw caps". `gap_px = 0` removes the crop and so the error, but the
+  backend is unmeasured on that board.
 
 The diagnostic that resolved the framerate question, worth reusing: the same
 stream through a bare `gst-launch` pipeline decoded at a full 30 fps while

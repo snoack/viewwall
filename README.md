@@ -234,6 +234,12 @@ is cut from each source by a videocrop, and `compositor` never offers a crop
 meta, so that element copies every frame of every tile instead of passing it
 through. `gap_px = 0` leaves the tiles abutting and costs nothing.
 
+That same missing crop meta is fatal rather than merely expensive on a Pi 3,
+where the hardware decoder hands videocrop DMA_DRM caps: with nothing to fall
+back on it refuses the crop outright and every seamed viewport dies at startup
+with "Dowstream doesn't support crop for non-raw caps". The compositor backend
+there needs `gap_px = 0`, and is otherwise unmeasured on that board.
+
 The compositor's cost scales with output resolution and refresh, not with the
 number of viewports: at 120Hz it blends twice as many frames for no visible
 gain once every camera is already showing every frame it sends. Pair it with a
