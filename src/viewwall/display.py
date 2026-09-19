@@ -3,10 +3,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+import logging
+import os
 import re
 import subprocess
 
 from .config import DisplayConfig
+
+LOG = logging.getLogger(__name__)
 
 class DisplayError(RuntimeError):
     """Raised when no usable active KMS output can be identified."""
@@ -96,6 +100,7 @@ def parse_kmsprint_all(text: str) -> list[DisplayState]:
 
 _SYSFS_DRM = Path("/sys/class/drm")
 _MODE_RE = re.compile(r"^(\d+)x(\d+)")
+_DEFAULT_CARD = "/dev/dri/card0"
 
 
 def available_modes(
@@ -160,6 +165,49 @@ def current_modes(sysfs_root: Path = _SYSFS_DRM) -> dict[int, tuple[int, int]]:
         if match:
             modes[connector_id] = (int(match.group(1)), int(match.group(2)))
     return modes
+
+
+def detect_card(sysfs_root: Path = _SYSFS_DRM) -> str:
+    """Name the DRM card whose connectors are the display outputs.
+
+    A Pi 3 has one card and it is card0, which is why that was the default for
+    so long. A Pi 5 has two: card0 is v3d, the render-only GPU with no
+    connectors at all, and card1 is vc4-drm, which owns both HDMI outputs.
+    Opening card0 there gives a card that can never scan out, and the failure
+    surfaces later as kmssink refusing a plane rather than as a bad device.
+
+    Connectors decide it rather than the driver name: sysfs nests each
+    connector under its card as "card1-HDMI-A-1", so a card that has one is a
+    card that can drive a screen. A connected connector wins over a merely
+    present one, so a second card with nothing plugged in does not take
+    precedence over the one showing a picture -- but a card with connectors
+    and nothing attached still beats a render node, which keeps an unplugged
+    display reporting "no connected KMS connector found" as it always did
+    instead of naming the wrong card.
+    """
+    with_connected: list[str] = []
+    with_connectors: list[str] = []
+    for entry in sorted(sysfs_root.glob("card[0-9]*")):
+        if "-" in entry.name:
+            # A connector ("card1-HDMI-A-1"), not a card.
+            continue
+        connectors = sorted(sysfs_root.glob(f"{entry.name}-*"))
+        if not connectors:
+            # A render-only node such as the Pi 5's v3d.
+            continue
+        with_connectors.append(entry.name)
+        for connector in connectors:
+            try:
+                status = (connector / "status").read_text().strip()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if status == "connected":
+                with_connected.append(entry.name)
+                break
+    for candidates in (with_connected, with_connectors):
+        if candidates:
+            return f"/dev/dri/{candidates[0]}"
+    return _DEFAULT_CARD
 
 
 def _run_kmsprint() -> str:
@@ -314,3 +362,5 @@ def _assign_planes(
     return {
         name: tuple(sorted(planes)) for name, planes in assignment.items()
     }
+
+

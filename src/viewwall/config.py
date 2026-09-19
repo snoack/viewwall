@@ -143,7 +143,10 @@ class DrmConfig:
 
     "device" names the card, not a connector: displays are connectors
     enumerated within it, and it is opened once into a file descriptor every
-    kmssink shares. "poll_interval_seconds" paces a single timer whose probe
+    kmssink shares. Left out of the file it is detected, which matters on a
+    Pi 5 where the card owning the connectors is card1 and card0 is the
+    render-only v3d node; see display.detect_card. "poll_interval_seconds"
+    paces a single timer whose probe
     already reports every connector, since "kmsprint -l" dumps the whole card.
     """
 
@@ -440,7 +443,18 @@ def load_config(path: str | Path, environ: Mapping[str, str] | None = None) -> A
         "drm.poll_interval_seconds",
     )
 
-    device = drm_raw.get("device", "/dev/dri/card0")
+    device = drm_raw.get("device")
+    if device is None:
+        # Detected rather than defaulted: the card that owns the connectors is
+        # card0 on a Pi 3 but card1 on a Pi 5, where card0 is the render-only
+        # v3d node. Setting drm.device pins one and skips the probe.
+        #
+        # Imported here rather than at module scope because display imports
+        # this module for DisplayConfig, and detection is the one thing
+        # configuration needs from it.
+        from .display import detect_card
+
+        device = detect_card()
     if not isinstance(device, str) or not device:
         raise ConfigError("drm.device must be a path")
 

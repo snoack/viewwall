@@ -5,6 +5,14 @@
 # Debian rather than a third-party Pi base, with the Raspberry Pi archive added
 # for kms++-utils: viewwall shells out to kmsprint for KMS discovery and that
 # package is not in the Debian archive.
+#
+# gstreamer1.0-libav is a hard dependency here, unlike the .deb where it is
+# only Recommends. It carries avdec_h264, the software H.264 fallback, and a
+# Pi 5 has no H.264 M2M decoder at all -- BCM2712 kept the HEVC block and
+# dropped the H.264 one -- so without it every feed fails to start with "no
+# supported decoder is available for H264". A Pi 3 hides this: v4l2h264dec
+# comes from the kernel, so the image looks complete until it is run on newer
+# hardware.
 FROM debian:trixie-slim
 
 # The Raspberry Pi archive key carries a SHA1 binding signature, which trixie's
@@ -24,6 +32,7 @@ RUN printf 'Types: deb\nURIs: http://archive.raspberrypi.com/debian/\nSuites: tr
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-tools \
+        gstreamer1.0-libav \
         kms++-utils \
     && rm -rf /var/lib/apt/lists/*
 

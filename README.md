@@ -322,8 +322,19 @@ services:
     image: ghcr.io/<owner>/viewwall:0.1.0
     restart: unless-stopped
     devices:
+      # card0 on a Pi 3, card1 on a Pi 5, where card0 is the render-only v3d
+      # node with no connectors. Check with: ls /sys/class/drm
       - /dev/dri/card0:/dev/dri/card0   # KMS output planes
-      - /dev/video10:/dev/video10       # hardware H.264 decoder
+      # A Pi 5 has no H.264 decoder and needs no video device for one; it
+      # software-decodes with avdec_h264. /dev/video19 is its HEVC decoder.
+      - /dev/video10:/dev/video10       # hardware H.264 decoder (Pi 3/4)
+      # H.265 needs these too. v4l2slh265dec is a stateless decoder, and
+      # GStreamer only registers one when it can reach the media controller
+      # node that drives it: without them the element does not exist and an
+      # H.265 feed fails to start, while the same feed works outside Docker.
+      - /dev/media0:/dev/media0         # media controller (stateless codecs)
+      - /dev/media1:/dev/media1
+      - /dev/media2:/dev/media2
     group_add:
       # Numeric GIDs, not names: group names are resolved inside the container,
       # whose /etc/group has no video or render entry. Check yours with
@@ -347,11 +358,17 @@ docker compose up -d
 ```
 
 Verified on a Raspberry Pi 3 running Raspberry Pi OS Trixie: the container
-renders all nine planes from live cameras with exactly the two device nodes and
-two groups above.
+renders all nine planes from live cameras with the device nodes and two groups
+above.
 
 Pass every `/dev/videoN` decoder node your Pi exposes if you are unsure which
-one GStreamer will pick; on a Pi 3 the H.264 decoder is `/dev/video10`.
+one GStreamer will pick; on a Pi 3 the H.264 decoder is `/dev/video10`, and on
+a Pi 5 the HEVC decoder is `/dev/video19`. Pass `/dev/media*` as well. A
+stateless decoder -- `v4l2slh265dec`, which is the only way viewwall decodes
+H.265 -- is registered by GStreamer only when it can reach the media
+controller node behind it, so without those an H.265 feed fails to start with
+"no supported decoder is available for H265" while the same feed plays on a
+native install.
 
 A native systemd install is lighter than Docker on a Pi 3, and is the
 recommended deployment.
@@ -359,10 +376,15 @@ recommended deployment.
 ## Supported hardware
 
 **Raspberry Pi 3, running Raspberry Pi OS.** Developed and verified on a Pi 3
-Model B+ with Raspberry Pi OS Trixie. Pi 4 and Pi 5 should work but are
-untested. There is little reason to reach for one: nine feeds leave the Pi 3's
-CPU around 76% idle, and the real ceiling is the VC4 scaler budget, which a
-newer model does not obviously lift.
+Model B+ with Raspberry Pi OS Trixie, which is what the `kms-planes` backend
+and its measurements describe.
+
+A Pi 5 also works and is where the `compositor` backend was measured, but it
+is a different trade rather than a faster Pi: BCM2712 dropped the H.264
+decoder block, so every feed is software-decoded with `avdec_h264`, and the
+DRM card that owns the connectors is `card1`. Nine feeds leave a Pi 3 around
+76% idle on `kms-planes`; the same wall on a Pi 5 under `compositor` costs
+most of a core. A Pi 4 should work and is untested.
 
 Older Pi models are not supported: they lack the KMS overlay planes the design
 depends on.

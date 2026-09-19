@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from viewwall.display import DisplayError, parse_kmsprint_all
@@ -295,3 +297,52 @@ def test_an_unconfigured_display_takes_the_first_connected(
     resolved = _detect(monkeypatch, TWO_DISPLAYS, configs, {"main": 1})
     assert resolved["main"].connector_id == 35
     assert (resolved["main"].width, resolved["main"].height) == (1920, 1080)
+
+
+def _card(root, name: str, connectors: dict[str, str]) -> None:
+    """Lay out one card in a fake sysfs, with "connector name -> status"."""
+    (root / name).mkdir()
+    for connector, status in connectors.items():
+        directory = root / f"{name}-{connector}"
+        directory.mkdir()
+        (directory / "status").write_text(status)
+
+
+def test_detect_card_finds_the_only_card_on_a_pi_3(tmp_path) -> None:
+    from viewwall.display import detect_card
+
+    _card(tmp_path, "card0", {"HDMI-A-1": "connected"})
+    assert detect_card(tmp_path) == "/dev/dri/card0"
+
+
+def test_detect_card_skips_the_render_node_on_a_pi_5(tmp_path) -> None:
+    from viewwall.display import detect_card
+
+    # card0 is v3d, which has no connectors at all; card1 is vc4-drm.
+    (tmp_path / "card0").mkdir()
+    _card(tmp_path, "card1", {"HDMI-A-1": "connected", "HDMI-A-2": "disconnected"})
+    assert detect_card(tmp_path) == "/dev/dri/card1"
+
+
+def test_detect_card_prefers_a_connected_output_over_a_dark_one(tmp_path) -> None:
+    from viewwall.display import detect_card
+
+    _card(tmp_path, "card0", {"HDMI-A-1": "disconnected"})
+    _card(tmp_path, "card1", {"HDMI-A-1": "connected"})
+    assert detect_card(tmp_path) == "/dev/dri/card1"
+
+
+def test_detect_card_still_names_a_card_with_nothing_plugged_in(tmp_path) -> None:
+    from viewwall.display import detect_card
+
+    # Unplugged should fail later with "no connected KMS connector found",
+    # not by naming the render node.
+    (tmp_path / "card0").mkdir()
+    _card(tmp_path, "card1", {"HDMI-A-1": "disconnected"})
+    assert detect_card(tmp_path) == "/dev/dri/card1"
+
+
+def test_detect_card_falls_back_when_sysfs_is_absent(tmp_path) -> None:
+    from viewwall.display import detect_card
+
+    assert detect_card(tmp_path / "nonexistent") == "/dev/dri/card0"
