@@ -6,42 +6,49 @@
 # for kms++-utils: viewwall shells out to kmsprint for KMS discovery and that
 # package is not in the Debian archive.
 #
-# gstreamer1.0-libav is a hard dependency here, unlike the .deb where it is
-# only Recommends. It carries avdec_h264, the software H.264 fallback, and a
-# Pi 5 has no H.264 M2M decoder at all -- BCM2712 kept the HEVC block and
-# dropped the H.264 one -- so without it every feed fails to start with "no
-# supported decoder is available for H264". A Pi 3 hides this: v4l2h264dec
-# comes from the kernel, so the image looks complete until it is run on newer
-# hardware.
+# The image installs the same .deb that a Pi installs, rather than copying the
+# module and writing an entry point of its own. Those two descriptions of the
+# package used to drift: gstreamer1.0-libav is only Recommends: in the .deb, so
+# an image that repeated the dependency list by hand shipped with no H.264
+# decoder at all, and every feed failed to start on a Pi 5 -- BCM2712 kept the
+# HEVC block and dropped the H.264 one, where a Pi 3 hides the gap because
+# v4l2h264dec comes from the kernel. Installing the package makes
+# packaging/debian/control the only place dependencies are named.
+# Pinned to the builder's own architecture rather than the target's. The
+# package is Architecture: all, so building it under QEMU once per target
+# platform would emulate an apt install and a shell script to produce the
+# identical .deb. BUILDPLATFORM is set by buildx; a plain "docker build"
+# without it falls back to the build host, which is the same thing.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends dpkg-dev python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+RUN scripts/build-deb.sh > /tmp/deb-path \
+    && cp "$(cat /tmp/deb-path)" /tmp/viewwall.deb
+
 FROM debian:trixie-slim
 
 # The Raspberry Pi archive key carries a SHA1 binding signature, which trixie's
 # default crypto policy rejects outright. Copy the keyring from the host's
 # raspberrypi-archive-keyring package instead of relaxing verification.
 COPY packaging/raspberrypi-archive-keyring.gpg /usr/share/keyrings/
+COPY --from=build /tmp/viewwall.deb /tmp/viewwall.deb
 
+# apt install rather than dpkg -i, so the package's own Depends are resolved
+# rather than left for a second command. gstreamer1.0-libav is named
+# explicitly instead of enabling recommends wholesale: it is the only
+# Recommends: the image needs, and --install-recommends would pull them for
+# every dependency in the tree as well.
 RUN printf 'Types: deb\nURIs: http://archive.raspberrypi.com/debian/\nSuites: trixie\nComponents: main\nSigned-By: /usr/share/keyrings/raspberrypi-archive-keyring.gpg\n' \
         > /etc/apt/sources.list.d/raspi.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        python3 \
-        python3-gi \
-        gir1.2-gstreamer-1.0 \
-        gir1.2-gst-plugins-base-1.0 \
-        gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good \
-        gstreamer1.0-plugins-bad \
-        gstreamer1.0-tools \
-        gstreamer1.0-libav \
-        kms++-utils \
+    && apt-get install -y --no-install-recommends /tmp/viewwall.deb gstreamer1.0-libav \
+    && rm -f /tmp/viewwall.deb \
     && rm -rf /var/lib/apt/lists/*
-
-COPY src/viewwall /usr/lib/python3/dist-packages/viewwall
-COPY examples/viewwall.toml /usr/share/viewwall/viewwall.toml
-
-RUN printf '#!/usr/bin/python3\nfrom viewwall.app import main\n\nif __name__ == "__main__":\n    main()\n' \
-        > /usr/bin/viewwall \
-    && chmod 0755 /usr/bin/viewwall
 
 # The GStreamer registry must be writable, or the container rebuilds it on
 # every start and logs a warning.

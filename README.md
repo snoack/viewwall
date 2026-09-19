@@ -224,8 +224,15 @@ Measured on a Pi 5 at 1920x1080, nine feeds of 640x360 (15-30 fps sources):
 | | `kms-planes` @120Hz | `compositor` @60Hz |
 |---|---|---|
 | per viewport | 13.4 fps, uniform | 13.7-29.9 fps, each at its camera's rate |
-| CPU | ~42% of one core | ~60% of one core |
+| CPU | ~55% of one core | ~70-80% of one core |
 | planes used | one per viewport | one per display |
+
+The compositor figure is a range because run-to-run spread on a shared Pi is
+several points; treat it as "most of a core", not a precise number. A
+`layout.gap_px` above zero adds roughly fifteen points on top of it: the seam
+is cut from each source by a videocrop, and `compositor` never offers a crop
+meta, so that element copies every frame of every tile instead of passing it
+through. `gap_px = 0` leaves the tiles abutting and costs nothing.
 
 The compositor's cost scales with output resolution and refresh, not with the
 number of viewports: at 120Hz it blends twice as many frames for no visible

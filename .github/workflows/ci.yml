@@ -18,3 +18,10 @@ jobs:
       - run: python -m compileall -q src tests
       - name: The package must build
         run: ./scripts/build-deb.sh
+      # The image builds the package inside its first stage, so a change to
+      # the build script or to debian/control can break it. Only the release
+      # workflow published an image, which meant finding that out at tag time.
+      # Native architecture only: buildx and QEMU belong to the release job,
+      # and what is being checked here is that the Dockerfile still builds.
+      - name: The image must build
+        run: docker build -t viewwall:ci .
