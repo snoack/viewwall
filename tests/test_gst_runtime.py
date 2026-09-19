@@ -266,6 +266,11 @@ def _activation_runtime(
         pixel_aspect_ratio=None,
         active_index=0,
         active_feed=active_feed,
+        output_total=0,
+        rate_sample=(1, 2),
+        keeping_up_at=100.0,
+        rate_shown=0,
+        rate_decoded=0,
     )
     runtime.viewports = {"upper_left": viewport}
     # Track replacement sinks without opening DRM.
@@ -274,6 +279,19 @@ def _activation_runtime(
 
     runtime._new_kms_sink = _new_sink  # type: ignore[method-assign]
     return runtime, viewport, log
+
+
+def test_activation_drops_the_rate_baseline_but_keeps_the_dwell() -> None:
+    # The baseline pairs this viewport's output total with the *outgoing*
+    # feed's decoded total, so carrying it across a switch makes the next
+    # interval subtract unrelated counters and read negative -- which passes
+    # the floor test and silently restarts the dwell. The dwell itself has to
+    # survive, or a viewport rotating every eight seconds could never reach
+    # the thirty it needs, which is the viewport the fault was seen on.
+    runtime, viewport, _log = _activation_runtime()
+    runtime._activate_viewport_feed(viewport, 1)
+    assert viewport.rate_sample is None
+    assert viewport.keeping_up_at == 100.0
 
 
 def test_activation_leaves_the_valve_open_at_the_end() -> None:
@@ -978,6 +996,8 @@ def test_a_declared_framerate_beats_measurement() -> None:
     assert not feed.observed_fps_applied
 
 
+
+
 def _metrics_runtime(queue_ns: int | None = 45_000_000) -> WallRuntime:
     runtime = object.__new__(WallRuntime)
     runtime._stopping = False
@@ -1582,6 +1602,50 @@ def test_a_tile_recovering_before_the_dwell_starts_over() -> None:
     assert runtime._tile_falling_behind(
         viewport, feed, 10.0 + WallRuntime.TILE_SLOW_SECONDS / 2
     ) is False
+
+
+def test_a_collapse_still_matures_across_rotations() -> None:
+    # The viewport this fault was seen on rotates every eight seconds while
+    # the poll runs every five, so the dwell has to survive a switch. It also
+    # has to survive the baseline being dropped at that switch, which is
+    # necessary because the two feeds' decoded totals are unrelated.
+    runtime, viewport, _tick = _rate_runtime(1, 30)
+    coop, run = SimpleNamespace(decoded_total=1_000_000), SimpleNamespace(
+        decoded_total=800_000
+    )
+    now = 0.0
+    fired = False
+    for step in range(12):
+        if step % 2 == 0:
+            # A rotation: the wall drops the stale baseline, keeps the dwell.
+            viewport.rate_sample = None
+        feed = coop if step % 4 < 2 else run
+        viewport.output_total += 1
+        feed.decoded_total += 30
+        fired = runtime._tile_falling_behind(viewport, feed, now)
+        if fired:
+            break
+        now += 5.0
+    assert fired, "a sustained collapse must mature despite rotations"
+    assert now >= WallRuntime.TILE_SLOW_SECONDS
+
+
+def test_a_rotation_does_not_reset_the_dwell() -> None:
+    # The specific defect: without dropping the baseline, a switch produced a
+    # negative decoded delta, which passes the floor test and restarts the
+    # clock. With it dropped, the dwell keeps running.
+    runtime, viewport, _tick = _rate_runtime(1, 30)
+    feed = runtime.feeds["cam"]
+    viewport.output_total, feed.decoded_total = 1, 30
+    runtime._tile_falling_behind(viewport, feed, 0.0)
+    viewport.output_total, feed.decoded_total = 2, 60
+    runtime._tile_falling_behind(viewport, feed, 5.0)
+    started = viewport.keeping_up_at
+    # Rotate: baseline dropped, dwell untouched.
+    viewport.rate_sample = None
+    viewport.output_total, feed.decoded_total = 3, 90
+    runtime._tile_falling_behind(viewport, feed, 10.0)
+    assert viewport.keeping_up_at == started
 
 
 def test_a_feed_decoding_nothing_never_matures_into_a_rebuild() -> None:

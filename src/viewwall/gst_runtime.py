@@ -995,7 +995,11 @@ class WallRuntime:
         previous = viewport.rate_sample
         viewport.rate_sample = (viewport.output_total, feed.decoded_total)
         if previous is None:
-            viewport.keeping_up_at = now
+            # No interval to judge: the first poll of a viewport, or the first
+            # after a rotation dropped the baseline. Neutral on purpose -- it
+            # cannot fire, and it must not clear the dwell either, or a
+            # viewport rotating faster than the dwell could never accumulate
+            # one. Only a tick that sees the tile keeping up clears it.
             return False
         shown = viewport.output_total - previous[0]
         decoded = feed.decoded_total - previous[1]
@@ -1009,6 +1013,9 @@ class WallRuntime:
             viewport.keeping_up_at = now
             return False
         if viewport.keeping_up_at is None:
+            # First judged interval that was not keeping up: the dwell starts
+            # here rather than at the first poll, so it measures time spent
+            # behind rather than time since startup.
             viewport.keeping_up_at = now
             return False
         return now - viewport.keeping_up_at >= self.TILE_SLOW_SECONDS
@@ -1482,6 +1489,15 @@ class WallRuntime:
         # in place they would be averaged with the new one's, and a viewport
         # rotating a 3fps and a 24fps camera would report a meaningless ~13.
         viewport.queued_frames = 0
+        # The rate baseline belongs to the feed that was showing: the next
+        # poll would otherwise subtract the incoming feed's decoded total from
+        # the outgoing one's, and a negative difference passes the floor test
+        # trivially. Left alone, that reset the dwell on every rotation, so a
+        # viewport switching every eight seconds could never accumulate the
+        # thirty it needs -- which is exactly the viewport the fault was seen
+        # on. The dwell itself is deliberately not reset: it measures how long
+        # the tile has failed to show what it decodes, whichever feed that is.
+        viewport.rate_sample = None
         viewport.metrics_since = time.monotonic()
         viewport.metrics_rotated = True
         LOG.info(
