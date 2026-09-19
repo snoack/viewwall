@@ -152,7 +152,7 @@ seam does not mean naming a screen.
 | `gap_px` | `0` | Seam between viewports, in pixels. Made by trimming that pixel off the edge of the video rather than drawing over it, so the picture is never scaled and every plane stays on the cheap 1:1 path. |
 | `outer_margin_px` | `0` | Inset from this screen's edges. |
 | `width`, `height` | active mode | Overrides the detected resolution. Both or neither. |
-| `mode` | connector default | Mode to drive the connector at, as `"1280x720"`. |
+| `mode` | connector default | Mode to drive the connector at, as `"1280x720"` or `"1280x720@60"`. Without a refresh rate the driver picks one, which on a panel offering 1920x1080 at 120, 60, 50, 30 and 24 is whichever it resolves first -- 120 on the measured panel. Naming the rate is the only way to choose, and the compositor backend wants 60 rather than 120: it blends every output frame on the CPU, so twice the refresh is twice the work for no visible gain once every camera is already showing every frame it sends. |
 
 **`[display_defaults]`** — `gap_px` and `outer_margin_px` for any display that
 does not set its own, including the discovered one.

@@ -956,6 +956,10 @@ def test_kms_planes_stays_the_default() -> None:
 
 
 def _modes_runtime(mode, background="#000000", probed=(1920, 1080)):
+    # config._mode() always yields (width, height, refresh|None); the tests
+    # name sizes, so widen them here rather than at every call site.
+    if mode is not None and len(mode) == 2:
+        mode = (mode[0], mode[1], None)
     runtime = object.__new__(WallRuntime)
     runtime.displays = {
         "main": DisplayState(
@@ -1025,6 +1029,7 @@ def test_background_errors_do_not_kill_the_wall(caplog) -> None:
         SimpleNamespace(get_name=lambda: "kms_viewport3_0")
     )
     runtime.background_sinks = {}
+    runtime._owned_framebuffers = []
     assert not runtime._is_background_source(
         SimpleNamespace(get_name=lambda: "background_src_main")
     )
@@ -1067,6 +1072,10 @@ def test_mode_applies_without_a_background_colour() -> None:
 
 
 def _background_runtime(colour: str | None, *, missing: bool = False, mode=None):
+    # config._mode() always yields (width, height, refresh|None); tests name
+    # sizes, so widen them here rather than at every call site.
+    if mode is not None and len(mode) == 2:
+        mode = (mode[0], mode[1], None)
     """A runtime stripped to what _build_background touches."""
     made: list[str] = []
     props: dict[str, object] = {}
@@ -1097,6 +1106,7 @@ def _background_runtime(colour: str | None, *, missing: bool = False, mode=None)
         displays=(SimpleNamespace(name="main", mode=mode),),
     )
     runtime.background_sinks = {}
+    runtime._owned_framebuffers = []
 
     def _element(factory: str, name: str):
         if missing:
@@ -1119,6 +1129,21 @@ def test_background_paints_the_configured_colour() -> None:
     assert any(name.startswith("background_src_") for name in made)
     # Alpha must be set or videotestsrc reads the colour as transparent.
     assert props["background_src_main.foreground-color"] == 0xFF204060
+
+
+def test_background_stays_at_a_still_frame_rate() -> None:
+    """A configured refresh is not a rate for the background to produce at.
+
+    It used to go in as the caps framerate, because kmssink matches a mode on
+    it. _set_configured_refresh() sets the mode through libdrm before this is
+    built, so all that remained was videotestsrc producing a full-screen
+    buffer 60 times a second to paint a colour that never changes.
+    """
+    runtime, _made, props = _background_runtime("#000000", mode=(1920, 1080, 60))
+    runtime._build_background()
+    caps = props["background_caps_main.caps"]
+    assert "framerate=1/2" in caps.replace(" ", "")
+    assert "framerate=60/1" not in caps.replace(" ", "")
 
 
 def test_background_uses_modesetting_rather_than_a_plane() -> None:

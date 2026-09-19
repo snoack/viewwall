@@ -20,10 +20,12 @@ from .config import (
     ViewportConfig,
 )
 from .display import (
+    DisplayError,
     DisplayState,
     available_modes,
     current_modes,
     detect_displays,
+    set_crtc_mode,
 )
 from .journal import format_fields
 from .layout import ResolvedViewport, SourceCrop, resolve_layout
@@ -281,12 +283,18 @@ class WallRuntime:
         self.composited_caps: dict[str, Any] = {}
         self._composited_totals: dict[str, tuple[int, int]] = {}
         self._feed_bins: dict[str, tuple[str, int]] = {}
+        # Framebuffers this process gave to a CRTC; see _set_configured_refresh.
+        self._owned_framebuffers: list[Any] = []
         self._retired_feed_bins: dict[str, Any] = {}
         self._stopping = False
         self._metrics_sampled_at = 0.0
         self._wall_dark = False
         self._fatal_error: str | None = None
         try:
+            # Inside the try with _build(), not above it: this raises when a
+            # connector does not offer the configured rate, and close() is
+            # what owns the DRM fd.
+            self._set_configured_refresh()
             self._build()
         except Exception:
             # _build() raises on any missing element or unusable plane. The
@@ -294,6 +302,49 @@ class WallRuntime:
             # the DRM fd, so let it run rather than relying on that.
             self.close()
             raise
+
+    def _set_configured_refresh(self) -> None:
+        """Drive each configured connector at its named refresh rate.
+
+        Only for a mode that names one; kmssink matches a mode by resolution
+        alone, which is why the wall came up at 120Hz on a panel whose first
+        1920x1080 entry is 120. Set on self.drm_fd because the kernel reverts
+        the mode when the fd that set it closes.
+        """
+        for display in self.config.displays:
+            mode = display.mode
+            if mode is None or mode[2] is None:
+                continue
+            state = self.displays.get(display.name)
+            if state is None:
+                continue
+            width, height, refresh = mode
+            # The colour goes in so the CRTC scans out a buffer this process
+            # owns. kmssink then has no reason to modeset, which is what its
+            # force-modesetting was silently undoing: it matches a mode on
+            # size alone and takes the first hit, so a panel listing
+            # 1920x1080@120 before @60 came up at 120 however this was set.
+            colour = self.config.drm.background
+            try:
+                owned = set_crtc_mode(
+                    self.drm_fd,
+                    state.connector_id,
+                    state.crtc_id,
+                    width,
+                    height,
+                    refresh,
+                    None if colour is None else int(colour[1:], 16),
+                )
+                if owned is not None:
+                    # Kept for the life of the process: releasing the
+                    # framebuffer drops the mode with it.
+                    owned.display = display.name
+                    self._owned_framebuffers.append(owned)
+            except DisplayError as exc:
+                # Fatal: the mode was asked for explicitly, and coming up at
+                # a different refresh rate silently is the failure this whole
+                # path exists to remove.
+                raise RuntimeDependencyError(str(exc)) from exc
 
     def _plane_demand(
         self, viewport_counts: Mapping[str, int] | None = None
@@ -335,7 +386,7 @@ class WallRuntime:
             state = self.displays.get(display.name)
             if state is None:
                 continue
-            width, height = display.mode
+            width, height, _refresh = display.mode
             if (state.width, state.height) == (width, height):
                 continue
             # Refuse a mode the display does not advertise. kmssink would
@@ -485,9 +536,14 @@ class WallRuntime:
         """
         colour = self.config.drm.background
         modes = {d.name for d in self.config.displays if d.mode is not None}
+        # Displays whose CRTC is already scanning out a framebuffer this
+        # process owns: _set_configured_refresh painted one. There is nothing
+        # for a background sink to do there, and building one would undo the
+        # refresh rate it just set.
+        owned = {b.display for b in self._owned_framebuffers}
         if self.compositing:
-            # Nothing for this sink to do there: the background is a pad
-            # beneath the viewports, and nothing else here needs a modeset.
+            # The background is a pad beneath the viewports there, and
+            # _set_configured_refresh() sets the mode.
             return
         # The same sink serves both jobs. Painting needs a colour; setting a
         # mode needs only the modeset, so a display naming one is built even
@@ -496,6 +552,8 @@ class WallRuntime:
         if colour is None and not modes:
             return
         for display_name, state in self.displays.items():
+            if display_name in owned:
+                continue
             if colour is None and display_name not in modes:
                 continue
             safe = display_name.replace("-", "_")
@@ -537,12 +595,11 @@ class WallRuntime:
             # sets the connector's mode when one is configured. state.width
             # and state.height already carry it: _apply_mode() replaced the
             # probed values before any of this was built.
-            # A named refresh rate goes in as the caps framerate, because that
-            # is the only thing kmssink matches a mode against: a panel
-            # offering 1920x1080 at 120, 60, 50, 30 and 24 otherwise gives
-            # whichever the driver resolves first. With no rate named, 1/2 is
-            # kept -- one still frame every two seconds is all a background
-            # needs, and it leaves the choice of mode to the driver.
+            # One still frame every two seconds, whatever the display runs
+            # at. This used to carry a configured refresh so kmssink would
+            # match the mode on it; _set_configured_refresh() does that
+            # through libdrm now, and all the rate did here was repaint an
+            # unchanging colour 60 times a second.
             filt.set_property(
                 "caps",
                 self.Gst.Caps.from_string(
@@ -589,18 +646,11 @@ class WallRuntime:
         )
         sink = self._element("kmssink", f"kms_{safe}")
         sink.set_property("fd", self.drm_fd)
-        # Neither plane-id nor force-modesetting, unlike the per-viewport
-        # sinks. Measured on a Pi 5, every combination including either one
-        # left the CRTC with no framebuffer attached -- black screen, no error
-        # from kmssink, every tile still reporting its full rate:
-        #
-        #   plane-id, no modeset -> plane 107, black
-        #   plane-id, modeset    -> plane 107, black
-        #   neither,  modeset    -> plane  83, black
-        #   neither,  neither    -> plane 107, WORKS
-        #
-        # So kmssink picks its own overlay above a CRTC something else lit,
-        # which is what the nine per-viewport sinks do under kms-planes.
+        # Neither plane-id nor force-modesetting: measured on a Pi 5, every
+        # combination including either one left the CRTC with no framebuffer
+        # and a black screen, with no error and every tile at its full rate.
+        # Left alone, kmssink picks its own overlay above a CRTC something
+        # else lit. The mode is set by _set_configured_refresh().
         self._set_if_present(sink, "force-aspect-ratio", False)
         self._set_if_present(sink, "skip-vsync", True)
         sink.set_property("async", False)

@@ -346,3 +346,61 @@ def test_detect_card_falls_back_when_sysfs_is_absent(tmp_path) -> None:
     from viewwall.display import detect_card
 
     assert detect_card(tmp_path / "nonexistent") == "/dev/dri/card0"
+
+
+def test_set_crtc_mode_is_not_fatal_without_libdrm(monkeypatch) -> None:
+    """A wall at the connector's default rate beats no wall."""
+    from viewwall import display as display_module
+
+    monkeypatch.setattr(display_module, "_libdrm", lambda: None)
+    assert display_module.set_crtc_mode(3, 35, 94, 1920, 1080, 60) is None
+
+
+def test_set_crtc_mode_rejects_an_unadvertised_rate(monkeypatch) -> None:
+    """Naming a rate the panel cannot show must say so, not pick another."""
+    from viewwall import display as display_module
+
+    class _Modes:
+        hdisplay, vdisplay, vrefresh = 1920, 1080, 120
+
+    class _Connector:
+        connector_id = 35
+        count_modes = 1
+        modes = [_Modes()]
+
+    class _Ptr:
+        contents = _Connector()
+
+        def __bool__(self) -> bool:
+            return True
+
+    lib = SimpleNamespace(
+        drmModeGetConnector=lambda fd, cid: _Ptr(),
+        drmModeFreeConnector=lambda ptr: None,
+    )
+    monkeypatch.setattr(display_module, "_libdrm", lambda: lib)
+    with pytest.raises(DisplayError, match="1920x1080@60"):
+        display_module.set_crtc_mode(3, 35, 94, 1920, 1080, 60)
+
+
+def test_set_crtc_mode_refuses_a_bogus_struct_layout(monkeypatch) -> None:
+    """A libdrm whose layout does not match must not be acted on."""
+    from viewwall import display as display_module
+
+    class _Connector:
+        connector_id = 999  # not the id that was asked for
+        count_modes = 1 << 20  # nonsense
+        modes: list[object] = []
+
+    class _Ptr:
+        contents = _Connector()
+
+        def __bool__(self) -> bool:
+            return True
+
+    lib = SimpleNamespace(
+        drmModeGetConnector=lambda fd, cid: _Ptr(),
+        drmModeFreeConnector=lambda ptr: None,
+    )
+    monkeypatch.setattr(display_module, "_libdrm", lambda: lib)
+    assert display_module.set_crtc_mode(3, 35, 94, 1920, 1080, 60) is None

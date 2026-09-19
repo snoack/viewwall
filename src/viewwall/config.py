@@ -53,7 +53,7 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # spelling this refuses. Also catches signs and non-ASCII digits.
 _NOT_FRACTION_RE = re.compile(r"[^0-9/]")
 _HEX_COLOUR_RE = re.compile(r"^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$")
-_MODE_RE = re.compile(r"^(\d{1,5})x(\d{1,5})$")
+_MODE_RE = re.compile(r"^(\d{1,5})x(\d{1,5})(?:@(\d{1,3}))?$")
 
 
 def parse_fraction(value: object, field: str) -> Fraction:
@@ -200,7 +200,8 @@ class DisplayConfig:
     # to lay out against, this changes what the screen scans out; the panel
     # scales it back up. Worth setting when the grid does not divide the
     # native mode into tiles the size the cameras send.
-    mode: tuple[int, int] | None = None
+    # (width, height, refresh) with refresh None when the file named none.
+    mode: tuple[int, int, int | None] | None = None
     gap_px: int = 0
     outer_margin_px: int = 0
 
@@ -321,7 +322,7 @@ def _positive_number(value: object, field: str) -> float:
     return float(value)
 
 
-def _mode(value: object, field: str) -> tuple[int, int] | None:
+def _mode(value: object, field: str) -> tuple[int, int, int | None] | None:
     """Parse a display mode written as WIDTHxHEIGHT.
 
     Distinct from width/height, which only say what resolution to lay out
@@ -335,12 +336,23 @@ def _mode(value: object, field: str) -> tuple[int, int] | None:
     match = _MODE_RE.match(value.strip())
     if match is None:
         raise ConfigError(
-            f'{field}.mode must look like "1280x720", not {value!r}'
+            f'{field}.mode must look like "1280x720" or "1280x720@60", '
+            f"not {value!r}"
         )
     width, height = int(match.group(1)), int(match.group(2))
     if width <= 0 or height <= 0:
         raise ConfigError(f"{field}.mode dimensions must be positive")
-    return width, height
+    # The refresh rate is optional, and leaving it out is not the same as
+    # asking for any rate: a panel advertising 1920x1080 at 120, 60, 50, 30
+    # and 24 gives whichever the driver resolves first, which on the measured
+    # panel is 120. Naming one is the only way to choose.
+    refresh = match.group(3)
+    if refresh is None:
+        return width, height, None
+    rate = int(refresh)
+    if rate <= 0:
+        raise ConfigError(f"{field}.mode refresh rate must be positive")
+    return width, height, rate
 
 
 def _background(value: object) -> str | None:

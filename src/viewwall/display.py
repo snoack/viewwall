@@ -3,9 +3,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+import ctypes
+import ctypes.util
+import fcntl
+import functools
 import logging
+import mmap
 import os
 import re
+import struct
 import subprocess
 
 from .config import DisplayConfig
@@ -364,3 +370,346 @@ def _assign_planes(
     }
 
 
+# --- mode setting -----------------------------------------------------------
+#
+# The one place the wall calls libdrm directly, because kmssink cannot express
+# a refresh rate: it matches a mode by resolution alone, so a panel offering
+# 1920x1080 at 120, 60, 50, 30 and 24 gives whichever the driver resolves
+# first -- 120 on the measured panel, the worst of them for a compositor
+# blending nine tiles every output frame.
+#
+# Called once at startup on the fd the runtime already holds, which is what
+# makes it stick: the kernel restores the previous mode when the fd that set
+# it closes, so a mode set on a borrowed descriptor would last only as long
+# as the call.
+#
+# The structs mirror libdrm's and are ABI-sensitive -- a mismatched layout
+# reads nonsense rather than failing -- so set_crtc_mode() sanity-checks what
+# it reads back before trusting any of it.
+
+
+class _DrmModeInfo(ctypes.Structure):
+    _fields_ = [
+        ("clock", ctypes.c_uint32),
+        ("hdisplay", ctypes.c_uint16),
+        ("hsync_start", ctypes.c_uint16),
+        ("hsync_end", ctypes.c_uint16),
+        ("htotal", ctypes.c_uint16),
+        ("hskew", ctypes.c_uint16),
+        ("vdisplay", ctypes.c_uint16),
+        ("vsync_start", ctypes.c_uint16),
+        ("vsync_end", ctypes.c_uint16),
+        ("vtotal", ctypes.c_uint16),
+        ("vscan", ctypes.c_uint16),
+        ("vrefresh", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("type", ctypes.c_uint32),
+        ("name", ctypes.c_char * 32),
+    ]
+
+
+class _DrmModeConnector(ctypes.Structure):
+    _fields_ = [
+        ("connector_id", ctypes.c_uint32),
+        ("encoder_id", ctypes.c_uint32),
+        ("connector_type", ctypes.c_uint32),
+        ("connector_type_id", ctypes.c_uint32),
+        ("connection", ctypes.c_uint),
+        ("mmWidth", ctypes.c_uint32),
+        ("mmHeight", ctypes.c_uint32),
+        ("subpixel", ctypes.c_uint),
+        ("count_modes", ctypes.c_int),
+        ("modes", ctypes.POINTER(_DrmModeInfo)),
+        ("count_props", ctypes.c_int),
+        ("props", ctypes.POINTER(ctypes.c_uint32)),
+        ("prop_values", ctypes.POINTER(ctypes.c_uint64)),
+        ("count_encoders", ctypes.c_int),
+        ("encoders", ctypes.POINTER(ctypes.c_uint32)),
+    ]
+
+
+class _DrmModeCrtc(ctypes.Structure):
+    _fields_ = [
+        ("crtc_id", ctypes.c_uint32),
+        ("buffer_id", ctypes.c_uint32),
+        ("x", ctypes.c_uint32),
+        ("y", ctypes.c_uint32),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("mode_valid", ctypes.c_int),
+        ("mode", _DrmModeInfo),
+        ("gamma_size", ctypes.c_int),
+    ]
+
+
+@functools.lru_cache(maxsize=1)
+def _libdrm() -> ctypes.CDLL | None:
+    """libdrm, or None when it cannot be loaded.
+
+    Never fatal. A wall that came up at the connector's default refresh rate
+    is what every release before this one shipped, and it beats no wall.
+
+    Cached because find_library() searches the linker cache -- one call per
+    configured display otherwise, and the None answer is worth remembering
+    too so a box without libdrm does not repeat the search.
+    """
+    path = ctypes.util.find_library("drm")
+    if path is None:
+        return None
+    try:
+        lib = ctypes.CDLL(path, use_errno=True)
+    except OSError:
+        return None
+    lib.drmModeGetConnector.restype = ctypes.POINTER(_DrmModeConnector)
+    lib.drmModeGetConnector.argtypes = [ctypes.c_int, ctypes.c_uint32]
+    lib.drmModeFreeConnector.argtypes = [ctypes.POINTER(_DrmModeConnector)]
+    lib.drmModeGetCrtc.restype = ctypes.POINTER(_DrmModeCrtc)
+    lib.drmModeGetCrtc.argtypes = [ctypes.c_int, ctypes.c_uint32]
+    lib.drmModeFreeCrtc.argtypes = [ctypes.POINTER(_DrmModeCrtc)]
+    lib.drmModeAddFB2.restype = ctypes.c_int
+    lib.drmModeAddFB2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32 * 4,
+        ctypes.c_uint32 * 4,
+        ctypes.c_uint32 * 4,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint32,
+    ]
+    lib.drmModeSetCrtc.restype = ctypes.c_int
+    lib.drmModeSetCrtc.argtypes = [
+        ctypes.c_int,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_int,
+        ctypes.POINTER(_DrmModeInfo),
+    ]
+    return lib
+
+
+# DRM_IOCTL_MODE_CREATE_DUMB / MAP_DUMB, from drm_mode.h. Encoded here rather
+# than derived: _IOWR('d', 0xB2, struct drm_mode_create_dumb) is stable ABI,
+# and computing it would mean reproducing the _IOC macros for one constant.
+_DRM_IOCTL_MODE_CREATE_DUMB = 0xC02064B2
+_DRM_IOCTL_MODE_MAP_DUMB = 0xC01064B3
+_DRM_FORMAT_XRGB8888 = 0x34325258  # 'XR24'
+
+
+class _BackgroundBuffer:
+    """A solid-colour framebuffer the CRTC can scan out on its own.
+
+    Held for the life of the process: the kernel drops the mode when the
+    framebuffer goes away, the same way it drops it when the fd closes.
+    """
+
+    def __init__(self, fb_id: int, handle: int) -> None:
+        self.fb_id = fb_id
+        self.handle = handle
+        # Set by the caller: which configured display this belongs to.
+        self.display: str | None = None
+
+
+def _create_background_fb(
+    lib, fd: int, width: int, height: int, colour: int
+) -> _BackgroundBuffer | None:
+    """Allocate a dumb buffer, fill it with one colour, register it as an FB.
+
+    Returns None on any failure: a wall with a visible console is worse than
+    no wall, so every step here degrades to letting the caller carry on.
+    """
+    # struct drm_mode_create_dumb: height, width, bpp, flags, handle, pitch, size
+    create = bytearray(struct.pack("IIIIIIQ", height, width, 32, 0, 0, 0, 0))
+    try:
+        fcntl.ioctl(fd, _DRM_IOCTL_MODE_CREATE_DUMB, create)
+    except OSError as exc:
+        LOG.warning("could not allocate a background buffer: %s", exc)
+        return None
+    _h, _w, _bpp, _flags, handle, pitch, size = struct.unpack("IIIIIIQ", create)
+
+    # struct drm_mode_map_dumb: handle, pad, offset
+    mapping = bytearray(struct.pack("IIQ", handle, 0, 0))
+    try:
+        fcntl.ioctl(fd, _DRM_IOCTL_MODE_MAP_DUMB, mapping)
+        _handle, _pad, offset = struct.unpack("IIQ", mapping)
+        with mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_WRITE,
+                       offset=offset) as buf:
+            # XR24 is little-endian BGRX in memory, so one 32-bit word
+            # repeated fills every pixel of every line.
+            buf[:] = struct.pack("<I", colour) * (size // 4)
+    except (OSError, ValueError) as exc:
+        LOG.warning("could not paint the background buffer: %s", exc)
+        return None
+
+    handles = (ctypes.c_uint32 * 4)(handle, 0, 0, 0)
+    pitches = (ctypes.c_uint32 * 4)(pitch, 0, 0, 0)
+    offsets = (ctypes.c_uint32 * 4)(0, 0, 0, 0)
+    fb_id = ctypes.c_uint32()
+    result = lib.drmModeAddFB2(
+        fd, width, height, _DRM_FORMAT_XRGB8888,
+        handles, pitches, offsets, ctypes.byref(fb_id), 0,
+    )
+    if result != 0:
+        LOG.warning(
+            "could not register the background buffer: %s",
+            os.strerror(ctypes.get_errno()),
+        )
+        return None
+    return _BackgroundBuffer(fb_id.value, handle)
+
+
+def set_crtc_mode(
+    fd: int,
+    connector_id: int,
+    crtc_id: int,
+    width: int,
+    height: int,
+    refresh: int,
+    background: int | None = None,
+) -> _BackgroundBuffer | None:
+    """Drive a connector at an exact refresh rate, and own what it scans out.
+
+    "fd" is the runtime's own DRM descriptor rather than one opened here: the
+    kernel reverts the mode when the descriptor that set it closes, so a mode
+    set on a borrowed fd would last only as long as this call.
+
+    With a background colour this allocates its own framebuffer and passes it
+    to drmModeSetCrtc, which puts it on the CRTC's primary plane -- the
+    scanout surface, not one of the overlays the viewports compete for, so it
+    costs none of their budget. That is what lets kmssink stop modesetting:
+    it matches a mode on width and height alone and takes the first hit, so
+    on a panel listing 1920x1080@120 before @60 its modeset silently replaced
+    the rate this function had just set. Owning the scanout buffer removes
+    its reason to modeset at all.
+
+    Without one the framebuffer already on the CRTC is reused. vc4 refuses
+    drmModeSetCrtc with fb_id 0 (ENOENT), and whatever lit the CRTC -- the
+    framebuffer console, in the measured case -- is a good enough buffer to
+    keep scanning out under the overlays. A CRTC with no framebuffer and no
+    colour to paint is left alone.
+
+    Returns the buffer it allocated, which the caller has to keep: the kernel
+    drops the mode when the framebuffer is released. None when it allocated
+    none, whether or not the mode changed.
+    """
+    lib = _libdrm()
+    if lib is None:
+        LOG.warning("libdrm is unavailable; leaving the mode alone")
+        return None
+
+    connector = lib.drmModeGetConnector(fd, connector_id)
+    if not connector:
+        LOG.warning("connector %d could not be read; leaving the mode alone", connector_id)
+        return None
+    try:
+        info = connector.contents
+        # Cheap guard against a struct layout that does not match the
+        # installed libdrm: these would be nonsense if the fields were
+        # misaligned, and acting on nonsense is worse than not acting.
+        if info.connector_id != connector_id or not 0 < info.count_modes < 1024:
+            LOG.warning(
+                "libdrm returned an unexpected connector layout "
+                "(id=%d modes=%d); leaving the mode alone",
+                info.connector_id,
+                info.count_modes,
+            )
+            return None
+        wanted = None
+        for index in range(info.count_modes):
+            candidate = info.modes[index]
+            if (candidate.hdisplay, candidate.vdisplay, candidate.vrefresh) == (
+                width,
+                height,
+                refresh,
+            ):
+                # Copied, not referenced: the connector is freed below and the
+                # mode has to outlive it.
+                wanted = _DrmModeInfo.from_buffer_copy(candidate)
+                break
+        if wanted is None:
+            offered = sorted(
+                {
+                    (
+                        info.modes[i].hdisplay,
+                        info.modes[i].vdisplay,
+                        info.modes[i].vrefresh,
+                    )
+                    for i in range(info.count_modes)
+                },
+                reverse=True,
+            )
+            if all(rate == 0 for _w, _h, rate in offered):
+                # Some drivers leave vrefresh at 0 and expect the rate to be
+                # derived from clock/htotal/vtotal. Nothing here can match,
+                # but that is this code's limitation rather than a bad
+                # configuration, and kmssink would have picked a mode of the
+                # right size regardless -- so warn and leave it to do that.
+                LOG.warning(
+                    "connector %d reports no refresh rates; leaving %dx%d to "
+                    "the driver's own choice of mode",
+                    connector_id,
+                    width,
+                    height,
+                )
+                return None
+            raise DisplayError(
+                f"connector {connector_id} does not offer {width}x{height}@{refresh}; "
+                "it offers "
+                + ", ".join(f"{w}x{h}@{r}" for w, h, r in offered[:8])
+            )
+    finally:
+        lib.drmModeFreeConnector(connector)
+
+    crtc = lib.drmModeGetCrtc(fd, crtc_id)
+    if not crtc:
+        LOG.warning("CRTC %d could not be read; leaving the mode alone", crtc_id)
+        return None
+    try:
+        current = crtc.contents
+        framebuffer = current.buffer_id
+        already = (
+            current.mode.hdisplay,
+            current.mode.vdisplay,
+            current.mode.vrefresh,
+        )
+    finally:
+        lib.drmModeFreeCrtc(crtc)
+
+    owned = None
+    if background is not None:
+        owned = _create_background_fb(lib, fd, width, height, background)
+        if owned is not None:
+            framebuffer = owned.fb_id
+
+    if already == (width, height, refresh) and owned is None:
+        return None
+    if framebuffer == 0:
+        # Nothing is lit and no colour was asked for, so there is no buffer
+        # to scan out. The sink's own modeset is the path for that case.
+        LOG.warning(
+            "CRTC %d has no framebuffer; leaving the mode alone", crtc_id
+        )
+        return None
+
+    connectors = (ctypes.c_uint32 * 1)(connector_id)
+    result = lib.drmModeSetCrtc(
+        fd, crtc_id, framebuffer, 0, 0, connectors, 1, ctypes.byref(wanted)
+    )
+    if result != 0:
+        raise DisplayError(
+            f"could not set {width}x{height}@{refresh} on connector "
+            f"{connector_id}: {os.strerror(ctypes.get_errno())}"
+        )
+    LOG.info(
+        "connector %d: mode set to %dx%d@%d (was %dx%d@%d)",
+        connector_id,
+        width,
+        height,
+        refresh,
+        *already,
+    )
+    return owned

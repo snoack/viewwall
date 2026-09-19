@@ -696,7 +696,7 @@ uri = "rtsp://nvr.invalid/feed"
     )
     config = load_config(config_path, {})
     assert config.displays[0].connector_id is None
-    assert config.displays[0].mode == (1280, 720)
+    assert config.displays[0].mode == (1280, 720, None)
 
 
 def test_several_displays_still_need_connector_ids(tmp_path: Path) -> None:
@@ -720,9 +720,15 @@ uri = "rtsp://nvr.invalid/feed"
 @pytest.mark.parametrize(
     ("written", "expected"),
     [
-        ("1280x720", (1280, 720)),
-        ("800x600", (800, 600)),
-        ("  640x480  ", (640, 480)),
+        # Refresh omitted stays None: "any advertised rate for this size".
+        ("1280x720", (1280, 720, None)),
+        ("800x600", (800, 600, None)),
+        ("  640x480  ", (640, 480, None)),
+        # Named explicitly, which is the only way to pick one of the several
+        # rates a panel offers for the same size.
+        ("1920x1080@60", (1920, 1080, 60)),
+        ("1920x1080@120", (1920, 1080, 120)),
+        ("  1280x720@24  ", (1280, 720, 24)),
     ],
 )
 def test_mode_is_parsed(tmp_path: Path, written: str, expected) -> None:
