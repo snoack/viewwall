@@ -9,6 +9,7 @@ import pytest
 
 from viewwall.display import DisplayState
 from viewwall.gst_runtime import RuntimeDependencyError, WallRuntime
+from viewwall.config import LayoutConfig, RectSpec, ViewportConfig
 from viewwall.layout import PixelRect, SourceCrop
 
 
@@ -87,6 +88,8 @@ def test_rotation_skips_unhealthy_feeds() -> None:
         "three": SimpleNamespace(state="healthy"),
     }
     viewport = SimpleNamespace(
+        # kms-planes: its own sink, no compositor pad.
+        mixer_pad=None,
         config=SimpleNamespace(feeds=("one", "two", "three")),
         active_index=0,
     )
@@ -163,6 +166,8 @@ def _aspect_runtime(render: PixelRect, crop: SourceCrop) -> tuple[WallRuntime, o
     runtime = object.__new__(WallRuntime)
     runtime.Gst = SimpleNamespace(Caps=_FakeCaps)
     viewport = SimpleNamespace(
+        # kms-planes: its own sink, no compositor pad.
+        mixer_pad=None,
         config=SimpleNamespace(index=1, name="viewport1", feeds=("porch", "drive")),
         aspect=_FakeElement("aspect_upper_left", log),
         crop_values=crop,
@@ -252,6 +257,8 @@ def _activation_runtime(
         "drive": SimpleNamespace(state="healthy", source_size=(480, 360)),
     }
     viewport = SimpleNamespace(
+        # kms-planes: its own sink, no compositor pad.
+        mixer_pad=None,
         config=SimpleNamespace(index=1, name="viewport1", feeds=("porch", "drive")),
         selector=_FakeElement("selector_upper_left", log),
         aspect=_FakeElement("aspect_upper_left", log),
@@ -465,7 +472,9 @@ def test_build_viewports_and_branches_construct_without_undefined_names() -> Non
     runtime = object.__new__(WallRuntime)
     runtime.Gst = SimpleNamespace(
         PadLinkReturn=SimpleNamespace(OK="OK"),
-        PadProbeType=SimpleNamespace(BUFFER="BUFFER"),
+        PadProbeType=SimpleNamespace(
+            BUFFER="BUFFER", EVENT_DOWNSTREAM="EVENT_DOWNSTREAM"
+        ),
         util_set_object_arg=lambda *a: None,
     )
     runtime.pipeline = SimpleNamespace(add=lambda e: made.append(e.get_name()))
@@ -481,7 +490,7 @@ def test_build_viewports_and_branches_construct_without_undefined_names() -> Non
         viewports=(
             SimpleNamespace(index=1, name="viewport1", feeds=("porch",), display="main"),
             SimpleNamespace(index=2, name="viewport2", feeds=("coop", "run"), display="main"),
-        )
+        ),
     )
     runtime.viewports = {}
     runtime._build_viewports()
@@ -495,6 +504,455 @@ def test_build_viewports_and_branches_construct_without_undefined_names() -> Non
     assert set(runtime.viewports["viewport2"].branch_crops) == {"coop", "run"}
     assert set(runtime.viewports["viewport1"].branch_crops) == {"porch"}
     assert any(name.startswith("crop_coop_to_viewport2") for name in made)
+
+
+def _compositing_runtime(made, linked, el_factory, background="#000000"):
+    """A runtime wired for the compositor backend, sharing the build fakes."""
+    runtime = object.__new__(WallRuntime)
+    runtime.compositing = True
+    runtime.drm_fd = 7
+    runtime.Gst = SimpleNamespace(
+        PadLinkReturn=SimpleNamespace(OK="OK"),
+        PadProbeType=SimpleNamespace(
+            BUFFER="BUFFER", EVENT_DOWNSTREAM="EVENT_DOWNSTREAM"
+        ),
+        util_set_object_arg=lambda *a: None,
+        Caps=SimpleNamespace(from_string=lambda text: text),
+    )
+    runtime.pipeline = SimpleNamespace(add=lambda e: made.append(e.get_name()))
+    runtime.displays = {
+        "main": SimpleNamespace(
+            plane_ids=(98, 109), connector_id=35, width=1920, height=1080
+        )
+    }
+    runtime._built = []
+
+    def _make(factory, name):
+        element = el_factory(name)
+        runtime._built.append(element)
+        return element
+
+    runtime._element = _make
+    runtime._add = lambda *els: [made.append(e.get_name()) for e in els]
+    runtime._link_many = lambda *els: [
+        linked.append((a.get_name(), b.get_name()))
+        for a, b in zip(els, els[1:])
+    ]
+    # Real _set_if_present writes the property when the element has it; the
+    # fakes all claim to, so honour it rather than silently dropping writes
+    # the tests then cannot see.
+    runtime._set_if_present = lambda obj, key, value: obj.set_property(key, value)
+    runtime._set_object_arg_if_present = lambda obj, key, value: obj.set_property(
+        key, value
+    )
+    runtime._on_viewport_buffer = lambda *a: None
+    runtime.config = SimpleNamespace(
+        drm=SimpleNamespace(background=background),
+        viewports=(
+            SimpleNamespace(index=1, name="viewport1", feeds=("porch",), display="main"),
+            SimpleNamespace(
+                index=2, name="viewport2", feeds=("coop", "run"), display="main"
+            ),
+        ),
+    )
+    runtime.viewports = {}
+    runtime.composited_sinks = {}
+    runtime.composited_caps = {}
+    runtime._composited_totals = {}
+    return runtime
+
+
+def test_compositor_backend_builds_one_sink_for_the_whole_display() -> None:
+    """Nine viewports, one commit: the point of the backend."""
+    made: list[str] = []
+    linked: list[tuple[str, str]] = []
+
+    class _El:
+        def __init__(self, name): self.name = name
+        def get_name(self): return self.name
+        def set_property(self, *_a): ...
+        def find_property(self, _p): return object()
+        def get_static_pad(self, d): return _Pad(f"{self.name}:{d}")
+        def request_pad_simple(self, t): return _Pad(f"{self.name}:{t}")
+        def link(self, other):
+            linked.append((self.name, other.name))
+            return True
+
+    class _Pad:
+        def __init__(self, name): self.name = name
+        def link(self, other):
+            linked.append((self.name, other.name))
+            return "OK"
+        def set_property(self, *_a): ...
+        def add_probe(self, *_a): return 1
+
+    runtime = _compositing_runtime(made, linked, _El)
+    runtime._build_viewports()
+
+    assert set(runtime.viewports) == {"viewport1", "viewport2"}
+    # Exactly one kmssink and one compositor, however many viewports.
+    assert sum(1 for n in made if n.startswith("kms_")) == 1
+    assert sum(1 for n in made if n.startswith("compositor_main")) == 1
+    # No viewport owns a sink; each owns a compositor pad instead.
+    for viewport in runtime.viewports.values():
+        assert viewport.sink is None
+        assert viewport.mixer_pad is not None
+
+
+def test_compositor_viewports_get_distinct_pads() -> None:
+    """Two viewports sharing one pad would stack them in the same tile."""
+    made: list[str] = []
+    linked: list[tuple[str, str]] = []
+
+    class _El:
+        def __init__(self, name):
+            self.name = name
+            self.requested = 0
+
+        def get_name(self): return self.name
+        def set_property(self, *_a): ...
+        def find_property(self, _p): return object()
+        def get_static_pad(self, d): return _Pad(f"{self.name}:{d}")
+
+        def request_pad_simple(self, t):
+            # Real request pads are numbered as they are handed out; a fake
+            # returning one name for every call would hide a collision.
+            self.requested += 1
+            return _Pad(f"{self.name}:{t}#{self.requested}")
+
+        def link(self, other): return True
+
+    class _Pad:
+        def __init__(self, name): self.name = name
+        def link(self, other): return "OK"
+        def set_property(self, *_a): ...
+        def add_probe(self, *_a): return 1
+
+    runtime = _compositing_runtime(made, linked, _El)
+    runtime._build_viewports()
+    pads = {v.mixer_pad.name for v in runtime.viewports.values()}
+    assert len(pads) == len(runtime.viewports)
+
+
+def _compositor_fakes(made, linked):
+    pads: list = []
+
+    class _El:
+        def __init__(self, name):
+            self.name = name
+            self.props: dict[str, object] = {}
+            self.requested = 0
+
+        def get_name(self): return self.name
+        def set_property(self, key, value): self.props[key] = value
+        def find_property(self, _p): return object()
+        def get_static_pad(self, d): return _Pad(f"{self.name}:{d}")
+
+        def request_pad_simple(self, t):
+            self.requested += 1
+            p = _Pad(f"{self.name}:{t}#{self.requested}")
+            pads.append(p)
+            return p
+
+        def link(self, other):
+            linked.append((self.name, other.name))
+            return True
+
+    class _Pad:
+        def __init__(self, name):
+            self.name = name
+            self.props: dict[str, object] = {}
+
+        def link(self, other):
+            linked.append((self.name, other.name))
+            return "OK"
+
+        def set_property(self, key, value): self.props[key] = value
+        def add_probe(self, *_a): return 1
+
+    _El.pads = pads
+    return _El, _Pad
+
+
+def test_compositor_paints_the_configured_background() -> None:
+    """drm.background is the wall's setting; the compositor must honour it."""
+    made: list[str] = []
+    linked: list[tuple[str, str]] = []
+    el, pad = _compositor_fakes(made, linked)
+    runtime = _compositing_runtime(made, linked, el, background="#102030")
+    runtime._build_viewports()
+    source = next(
+        e for e in runtime._built if e.get_name().startswith("compositor_bg_src_main")
+    )
+    # The colour itself, not merely that a source was built: videotestsrc
+    # takes 0xAARRGGBB and reads a zero alpha byte as fully transparent, so
+    # the opaque byte has to be there too.
+    assert source.props["foreground-color"] == 0xFF102030
+    assert source.props["pattern"] == "solid-color"
+
+
+def test_compositor_refuses_background_none(tmp_path) -> None:
+    """"none" shows the console through the gaps, and there is no console
+    behind a full-screen composited frame. Refused in configuration rather
+    than reinterpreted into something else at runtime."""
+    from viewwall.config import ConfigError, load_config
+
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[drm]
+output_backend = "compositor"
+background = "none"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+
+[[viewports]]
+x = 0
+y = 0
+width = 1
+height = 1
+feeds = ["camera"]
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="kms-planes"):
+        load_config(config_path, {})
+
+
+def test_kms_planes_still_allows_background_none(tmp_path) -> None:
+    """The setting keeps its meaning on the backend that can honour it."""
+    from viewwall.config import load_config
+
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[drm]
+background = "none"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+
+[[viewports]]
+x = 0
+y = 0
+width = 1
+height = 1
+feeds = ["camera"]
+""",
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).drm.background is None
+
+
+def test_compositor_background_sits_below_the_viewports() -> None:
+    """Otherwise a full-screen background hides every tile."""
+    made: list[str] = []
+    linked: list[tuple[str, str]] = []
+    el, pad = _compositor_fakes(made, linked)
+    runtime = _compositing_runtime(made, linked, el, background="#000000")
+    runtime._build_viewports()
+    # Both halves of the invariant: the viewports above, and the background
+    # below them. Asserting only the viewports would pass with the background
+    # at any zorder at all, including one that hides the whole wall.
+    for viewport in runtime.viewports.values():
+        assert viewport.mixer_pad.props["zorder"] == 1
+    bg_pads = [p for p in el.pads if p.props.get("zorder") == 0]
+    assert len(bg_pads) == 1, "the background pad must sit at zorder 0"
+
+
+def test_compositor_keeps_its_capsfilter_for_a_mode_change() -> None:
+    """The buffer size has to move with the rectangle, or the wall stretches.
+
+    _apply_layout retargets both when a display changes resolution. It reads
+    the capsfilter out of composited_caps, so a compositor that built one and
+    dropped it turned that repair into a silent no-op: the rectangle moved,
+    the compositor kept producing the old resolution into it, and the wall
+    showed its top-left corner blown up to fill the screen.
+    """
+    made: list[str] = []
+    linked: list[tuple[str, str]] = []
+    el, pad = _compositor_fakes(made, linked)
+    runtime = _compositing_runtime(made, linked, el, background="#000000")
+    runtime._build_viewports()
+
+    caps = runtime.composited_caps.get("main")
+    assert caps is not None, "the compositor must keep its capsfilter"
+    # Built at the display's current size...
+    assert "width=1920" in caps.props["caps"].replace(" ", "")
+    assert "height=1080" in caps.props["caps"].replace(" ", "")
+
+    # ...and retargeted when the mode changes under it.
+    runtime.displays["main"] = SimpleNamespace(
+        plane_ids=(98, 109), connector_id=35, width=1280, height=720
+    )
+    runtime.GstVideo = SimpleNamespace(
+        VideoOverlay=SimpleNamespace(set_render_rectangle=lambda *_a: True)
+    )
+    runtime.config.displays = (
+        SimpleNamespace(name="main", gap_px=0, outer_margin_px=0),
+    )
+    runtime.config.layout_for = lambda _d: LayoutConfig(gap_px=0, outer_margin_px=0)
+    real = tuple(
+        ViewportConfig(
+            index=i,
+            rect=RectSpec(
+                x=Fraction(0), y=Fraction(0), width=Fraction(1), height=Fraction(1)
+            ),
+            feeds=v.feeds,
+            display="main",
+        )
+        for i, v in enumerate(runtime.config.viewports, 1)
+    )
+    runtime.config.viewports_for = lambda _d: real
+    runtime.feeds = {
+        f: SimpleNamespace(source_size=(640, 360))
+        for v in runtime.config.viewports
+        for f in v.feeds
+    }
+    runtime._apply_layout("main")
+    assert "width=1280" in caps.props["caps"].replace(" ", "")
+    assert "height=720" in caps.props["caps"].replace(" ", "")
+
+
+def test_compositor_background_does_not_pin_a_framerate() -> None:
+    """compositor emits at its slowest input's rate.
+
+    A framerate on the background -- the 1/2 that _build_background() uses for
+    a static modeset frame -- throttled the whole wall to 0.5 fps on hardware.
+    """
+    made: list[str] = []
+    linked: list[tuple[str, str]] = []
+    el, pad = _compositor_fakes(made, linked)
+    runtime = _compositing_runtime(made, linked, el, background="#000000")
+    runtime._build_viewports()
+    bg_caps = next(
+        e for e in runtime._built if e.get_name().startswith("compositor_bg_caps")
+    )
+    assert "framerate" not in bg_caps.props["caps"]
+
+
+def test_compositor_forces_square_pixels() -> None:
+    """A camera's PAR has nothing to say once pad geometry places the source.
+
+    A Unifi G3 Dome advertises 189/190, which letterboxed ~3px of background
+    down the right of its tile. Applied to every viewport, not just that one.
+    """
+    made: list[str] = []
+    linked: list[tuple[str, str]] = []
+    el, pad = _compositor_fakes(made, linked)
+    runtime = _compositing_runtime(made, linked, el, background="#000000")
+    runtime._build_viewports()
+    aspects = [e for e in runtime._built if e.get_name().startswith("aspect_")]
+    assert aspects
+    for aspect in aspects:
+        assert "pixel-aspect-ratio=1/1" in aspect.props["caps"].replace(" ", "")
+
+
+def test_composited_rate_is_reported_per_display(caplog) -> None:
+    """The per-viewport lines say what each tile handed the compositor; this
+    is the other half -- what the one sink actually scanned out."""
+    import logging
+
+    runtime = object.__new__(WallRuntime)
+    runtime.compositing = True
+    runtime.composited_sinks = {"main": object()}
+    runtime._composited_totals = {"main": (100, 2)}
+    runtime._sink_presented = lambda _sink: (250, 5)
+    with caplog.at_level(logging.INFO, logger="viewwall.gst_runtime"):
+        runtime._report_composited_rate(10.0)
+    line = "".join(r.getMessage() for r in caplog.records)
+    # 150 frames over 10s.
+    assert "composited_fps=15.0" in line.replace("VW_COMPOSITED_FPS", "composited_fps")
+    assert runtime._composited_totals["main"] == (250, 5)
+
+
+def test_composited_rate_is_silent_under_kms_planes() -> None:
+    """There is no single composited frame to measure under that backend."""
+    runtime = object.__new__(WallRuntime)
+    runtime.compositing = False
+    runtime.composited_sinks = {}
+    runtime.composited_caps = {}
+    runtime._composited_totals = {}
+    runtime._report_composited_rate(10.0)  # must not raise
+
+
+def test_plane_demand_collapses_for_the_compositor_everywhere() -> None:
+    """The display poll re-probes on every resolution change.
+
+    It computed its own demand and did not know about the backend, so a
+    nine-viewport wall asked for nine overlay planes it never uses -- enough
+    to fail the probe on a Pi 3, where five is the practical limit.
+    """
+    runtime = object.__new__(WallRuntime)
+    runtime.compositing = True
+    runtime.config = SimpleNamespace(
+        displays=(SimpleNamespace(name="main"),),
+        viewports_for=lambda display: (1, 2, 3, 4, 5, 6, 7, 8, 9),
+    )
+    # Both call sites: startup passes counts, the poll passes nothing.
+    assert runtime._plane_demand({"main": 9}) == {"main": 1}
+    assert runtime._plane_demand() == {"main": 1}
+
+    runtime.compositing = False
+    assert runtime._plane_demand({"main": 9}) == {"main": 9}
+    assert runtime._plane_demand() == {"main": 9}
+
+
+def test_a_dead_tile_leaves_the_compositor_blend() -> None:
+    """Closing the valve is not enough under the compositor.
+
+    compositor keeps blending the last buffer it received into every output
+    frame, so a dead camera froze on its final picture -- which reads as a
+    working camera, worse than a black tile.
+    """
+    runtime = object.__new__(WallRuntime)
+    runtime.compositing = True
+    pad = SimpleNamespace(props={}, set_property=lambda k, v: pad.props.__setitem__(k, v))
+    viewport = SimpleNamespace(
+        mixer_pad=pad,
+        sink=None,
+        active_feed="porch",
+        valve=SimpleNamespace(set_property=lambda *a: None),
+        config=SimpleNamespace(index=1, feeds=("porch",)),
+    )
+    runtime._show_viewport_offline(viewport)
+    assert pad.props["alpha"] == 0.0
+
+
+def test_the_compositor_crops_for_its_seam_too() -> None:
+    """The gap is cut from the source, not drawn over the output.
+
+    Without the crop a 640x360 feed lands in a 639x359 destination, which is
+    a resize of every frame of every tile: measured on a Pi 5, that put 63%
+    of the process into Orc and libgstvideo and took the wall from 58% of a
+    core to 127%. With it the source is 639x359 and lands 1:1.
+    """
+    made: list[str] = []
+    linked: list[tuple[str, str]] = []
+    el, pad = _compositor_fakes(made, linked)
+    runtime = _compositing_runtime(made, linked, el)
+    runtime._build_viewports()
+    runtime.feeds = {
+        name: SimpleNamespace(tee=el(f"tee_{name}"), config=SimpleNamespace(name=name))
+        for name in ("porch", "coop", "run")
+    }
+    runtime.pipeline.add = lambda e: made.append(e.get_name())
+    runtime._connect_feed_branches()
+    assert any(n.startswith("crop_") for n in made)
+    for viewport in runtime.viewports.values():
+        assert viewport.branch_crops, "a composited viewport needs its crop"
+
+
+def test_kms_planes_stays_the_default() -> None:
+    """The shipped zero-copy path must not change under anyone's feet."""
+    from viewwall.config import DrmConfig
+
+    assert DrmConfig().output_backend == "kms-planes"
+    # Deliberately not asserting WallRuntime.compositing: it is set in
+    # __init__, and the class-level declaration is None so that a path
+    # reading it on a half-built runtime raises rather than quietly
+    # behaving as kms-planes.
 
 
 def _modes_runtime(mode, background="#000000", probed=(1920, 1080)):
@@ -996,9 +1454,6 @@ def test_a_declared_framerate_beats_measurement() -> None:
     assert not feed.observed_fps_applied
 
 
-
-
-
 def test_queue_level_reports_the_buffer_count() -> None:
     # The decisive number when a rotating viewport is slow to change picture.
     # current-level-time on a buffer-bounded queue is just the count divided
@@ -1009,7 +1464,6 @@ def test_queue_level_reports_the_buffer_count() -> None:
         get_property=lambda prop: 32 if prop == "current-level-buffers" else None
     )
     assert runtime._queue_level_buffers(queue) == 32
-
 
 
 def test_queue_level_is_absent_when_the_queue_cannot_say() -> None:
@@ -1524,6 +1978,8 @@ def test_the_first_frame_after_a_switch_is_timed(monkeypatch, caplog) -> None:
     runtime = object.__new__(WallRuntime)
     runtime.Gst = SimpleNamespace(PadProbeReturn=SimpleNamespace(OK="OK"))
     viewport = SimpleNamespace(
+        # kms-planes: its own sink, no compositor pad.
+        mixer_pad=None,
         config=SimpleNamespace(index=9),
         active_feed="coop",
         queued_frames=0,
@@ -1551,6 +2007,8 @@ def _tile_runtime(last_output_at, feed_state="healthy"):
     runtime._fatal_error = None
     runtime.rebuilt: list[str] = []
     viewport = SimpleNamespace(
+        # kms-planes: its own sink, no compositor pad.
+        mixer_pad=None,
         config=SimpleNamespace(index=1),
         active_feed="cam",
         last_output_at=last_output_at,

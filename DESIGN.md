@@ -9,9 +9,13 @@ OS Trixie with nine UniFi Protect feeds.
 These are choices, not accidents, and each rules out an otherwise obvious
 implementation:
 
-- **No compositor.** No X11, Wayland, desktop environment or software video
-  compositor. Each viewport scans out from its own KMS overlay plane, so nine feeds
-  never pass through a mixer.
+- **No desktop.** No X11, Wayland or desktop environment. The default backend
+  (`drm.output_backend = "kms-planes"`) additionally uses no mixer at all: each
+  viewport scans out from its own KMS overlay plane. That is the zero-copy path
+  and the one a Pi 3 wants. `"compositor"` trades it for a GStreamer
+  `compositor` and one plane per display, which costs a CPU blend of the whole
+  frame and buys each tile its camera's own rate rather than a share of the
+  CRTC's commit budget; the README compares them with measured numbers.
 - **No pixel processing in Python.** Python builds and supervises a native
   GStreamer graph and never maps, copies, scales or inspects video. Any
   operation on the picture is done by an element or by KMS.
@@ -49,14 +53,25 @@ UniFi Protect RTSP
      or rtph265depay / h265parse / v4l2slh265dec
   -> watchdog (decoded-frame stall detection)
   -> DMA-BUF
+  -> decode queue
   -> tee
   -> per-branch videocrop (before the selector; keeps the plane 1:1)
   -> per-viewport input-selector
   -> valve (closed while the viewport has no healthy feed)
-  -> pixel-aspect metadata adjusted to fill the viewport
-  -> leaky output queue
-  -> kmssink / KMS overlay plane
+  -> capssetter
+  -> output queue
+  -> kms-planes:  kmssink / KMS overlay plane, one per viewport
+     compositor:  compositor sink pad -> one kmssink for the display
 ```
+
+The tail is where the two backends differ. Under `kms-planes` the capssetter
+carries a pixel aspect ratio that stretches the source to its tile, and the
+output queue is leaky: a per-viewport sink pulls at the CRTC rate, so dropping
+the oldest frame bounds latency. Under `compositor` the pad's own geometry
+does the stretching, the capssetter instead forces square pixels so a camera
+declaring a non-unity ratio is not scaled twice, and none of the queues leak --
+one mixer pulls from nine pads on its own deadline, and a leaky queue in front
+of it turns back-pressure into compounding loss.
 
 Python only constructs and controls this native GStreamer graph. It does not
 map, copy, scale, or inspect video pixels. A feed is decoded once even when it
@@ -460,9 +475,11 @@ Recorded so they are not re-attempted:
   ceiling". That measurement was taken with a starved 2-buffer output queue and
   the ceiling does not exist. With `qos=false` the sinks drop ~0% of what they
   receive, so an atomic presenter would optimise a path that is not lossy.
-- **A Wayland compositor (Weston)** and **`glvideomixer`**. Both reintroduce
-  the compositing step the design exists to avoid, and Weston caps out well
-  below nine real feeds on this hardware.
+- **A Wayland compositor (Weston)** and **`glvideomixer`**. Weston caps out
+  well below nine real feeds on this hardware, and the GL paths are unusable
+  on a Pi 5: `glimagesink` scans out corrupted colour and `gldownload`
+  segfaults exporting a dmabuf from a `glvideomixer`. CPU `compositor` is the
+  mixer that shipped instead, as an opt-in backend rather than as the default.
 - **Software HEVC decoding.** See the design constraints above.
 
 The diagnostic that resolved the framerate question, worth reusing: the same

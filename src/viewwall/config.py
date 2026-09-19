@@ -146,12 +146,28 @@ class DrmConfig:
     kmssink shares. Left out of the file it is detected, which matters on a
     Pi 5 where the card owning the connectors is card1 and card0 is the
     render-only v3d node; see display.detect_card. "poll_interval_seconds"
-    paces a single timer whose probe
-    already reports every connector, since "kmsprint -l" dumps the whole card.
+    paces a single timer whose probe already reports every connector, since
+    "kmsprint -l" dumps the whole card.
     """
 
     device: str = "/dev/dri/card0"
     poll_interval_seconds: float = 2.0
+    # Which output path the viewports take.
+    #
+    # "kms-planes" gives every viewport its own overlay plane and its own
+    # kmssink. Zero-copy, but each sink issues a separate legacy
+    # drmModeSetPlane and those serialise into one commit per vblank per
+    # CRTC, so the viewports share the refresh rate between them however fast
+    # their cameras run: nine tiles measured 6.7 fps each at 60Hz, 13.4 at
+    # 120Hz.
+    #
+    # "compositor" blends them into one frame scanned out by a single
+    # kmssink, so one commit carries the whole wall and each tile runs at its
+    # own feed's rate -- 13.7-29.9 fps for the same nine, at about 60% of a
+    # Pi 5 core against 42%. The cost is a CPU blend of the whole output
+    # frame, which scales with resolution and refresh rather than with the
+    # number of viewports, so it wants a lower refresh than kms-planes does.
+    output_backend: str = "kms-planes"
     # What to paint underneath the viewports. Nothing draws there otherwise,
     # so the framebuffer console shows through wherever no viewport covers:
     # the gaps, the outer margin, and any viewport whose plane is disabled
@@ -159,6 +175,8 @@ class DrmConfig:
     # which "none" in the file selects.
     background: str | None = "#000000"
 
+
+OUTPUT_BACKENDS = frozenset({"kms-planes", "compositor"})
 
 DEFAULT_DISPLAY_NAME = "main"
 
@@ -382,7 +400,9 @@ def _mapping(value: object, field: str, allowed: Container[str] | None = None) -
     return value
 
 
-_DRM_KEYS = frozenset({"device", "poll_interval_seconds", "background"})
+_DRM_KEYS = frozenset(
+    {"device", "poll_interval_seconds", "background", "output_backend"}
+)
 # Settings that describe one output. [display_defaults] supplies them to every
 # display that does not say otherwise, including the discovered one.
 _DISPLAY_DEFAULT_KEYS = frozenset({"gap_px", "outer_margin_px"})
@@ -458,10 +478,32 @@ def load_config(path: str | Path, environ: Mapping[str, str] | None = None) -> A
     if not isinstance(device, str) or not device:
         raise ConfigError("drm.device must be a path")
 
+    backend = drm_raw.get("output_backend", "kms-planes")
+    if backend not in OUTPUT_BACKENDS:
+        raise ConfigError(
+            f"drm.output_backend must be one of {', '.join(sorted(OUTPUT_BACKENDS))}, "
+            f"not {backend!r}"
+        )
+
+    background = _background(drm_raw.get("background", "#000000"))
+    if background is None and backend == "compositor":
+        # "none" means "leave the framebuffer console showing through the
+        # gaps", which only means anything when the viewports are separate
+        # planes over a primary the console still owns. The compositor blends
+        # the whole output into one frame on one plane, so there is no console
+        # left to show through and nothing the setting could honour. Refused
+        # rather than quietly reinterpreted.
+        raise ConfigError(
+            'drm.background = "none" needs drm.output_backend = "kms-planes": '
+            "the compositor backend draws the whole screen, so there is no "
+            "console behind it to leave showing"
+        )
+
     drm = DrmConfig(
         device=device,
         poll_interval_seconds=poll_interval,
-        background=_background(drm_raw.get("background", "#000000")),
+        background=background,
+        output_backend=backend,
     )
 
     def _display(display_raw: dict[str, Any], field: str, name: str) -> DisplayConfig:

@@ -588,6 +588,94 @@ uri = "rtsp://nvr.invalid/feed"
     assert config.drm.poll_interval_seconds == 30
 
 
+def test_output_backend_defaults_to_kms_planes(tmp_path: Path) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).drm.output_backend == "kms-planes"
+
+
+def test_output_backend_selects_the_compositor(tmp_path: Path) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[drm]
+output_backend = "compositor"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).drm.output_backend == "compositor"
+
+
+def test_an_unknown_output_backend_names_the_valid_ones(tmp_path: Path) -> None:
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[drm]
+output_backend = "opengl"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="compositor, kms-planes"):
+        load_config(config_path, {})
+
+
+def test_drm_device_is_detected_when_the_file_omits_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from viewwall import display as display_module
+
+    monkeypatch.setattr(display_module, "detect_card", lambda: "/dev/dri/card7")
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).drm.device == "/dev/dri/card7"
+
+
+def test_an_explicit_drm_device_skips_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from viewwall import display as display_module
+
+    def fail() -> str:
+        raise AssertionError("detection ran despite an explicit drm.device")
+
+    monkeypatch.setattr(display_module, "detect_card", fail)
+    config_path = tmp_path / "viewwall.toml"
+    config_path.write_text(
+        """
+[drm]
+device = "/dev/dri/card0"
+
+[feeds.camera]
+uri = "rtsp://nvr.invalid/feed"
+"""
+        + _MINIMAL_VIEWPORTS,
+        encoding="utf-8",
+    )
+    assert load_config(config_path, {}).drm.device == "/dev/dri/card0"
+
+
 def test_one_display_needs_no_connector_id(tmp_path: Path) -> None:
     """A single table has no ambiguity to resolve.
 
@@ -631,7 +719,11 @@ uri = "rtsp://nvr.invalid/feed"
 
 @pytest.mark.parametrize(
     ("written", "expected"),
-    [("1280x720", (1280, 720)), ("800x600", (800, 600)), ("  640x480  ", (640, 480))],
+    [
+        ("1280x720", (1280, 720)),
+        ("800x600", (800, 600)),
+        ("  640x480  ", (640, 480)),
+    ],
 )
 def test_mode_is_parsed(tmp_path: Path, written: str, expected) -> None:
     config_path = tmp_path / "viewwall.toml"

@@ -152,7 +152,7 @@ seam does not mean naming a screen.
 | `gap_px` | `0` | Seam between viewports, in pixels. Made by trimming that pixel off the edge of the video rather than drawing over it, so the picture is never scaled and every plane stays on the cheap 1:1 path. |
 | `outer_margin_px` | `0` | Inset from this screen's edges. |
 | `width`, `height` | active mode | Overrides the detected resolution. Both or neither. |
-| `mode` | the current mode | Drive this output at `"WIDTHxHEIGHT"` instead of what it is already showing, letting the screen scale the result back up. Set it when the grid does not divide the native mode into tiles the size the cameras send: a 2x2 wall of 640x360 feeds fills 1280x720 exactly, and upscales every tile by half on a 1080p panel for no extra detail. Works with `background = "none"`: the same sink performs the modeset either way, and simply paints nothing visible behind the tiles. |
+| `mode` | connector default | Mode to drive the connector at, as `"1280x720"`. |
 
 **`[display_defaults]`** — `gap_px` and `outer_margin_px` for any display that
 does not set its own, including the discovered one.
@@ -200,9 +200,47 @@ one output and a plane handed to one display is not available to the other.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `device` | `"/dev/dri/card0"` | DRM card to open. Displays are connectors within one card, not separate devices. |
+| `device` | detected | DRM card to open. Displays are connectors within one card, not separate devices. Detected from the card that owns the connectors, which is `card0` on a Pi 3 but `card1` on a Pi 5; set it to pin one. |
 | `poll_interval_seconds` | `2` | How often to re-probe the card for a resolution change. One probe reports every connector. |
-| `background` | `"#000000"` | Color painted under the viewports as `#RRGGBB` or `"none"` to leave the framebuffer console showing in the background. |
+| `background` | `"#000000"` | Color painted under the viewports as `#RRGGBB`, or `"none"` to leave the framebuffer console showing. `"none"` needs `output_backend = "kms-planes"`: the compositor draws the whole screen, so no console is left behind it. |
+| `output_backend` | `"kms-planes"` | How viewports reach the screen. See below. |
+
+#### Output backend
+
+`kms-planes` gives every viewport its own KMS overlay plane and its own
+`kmssink`. The video path is zero-copy, but each sink issues a separate legacy
+`drmModeSetPlane`, and those serialise into one commit per vblank per CRTC: on
+a 60Hz output nine viewports share 60 commits a second and get about 6.7 each,
+whatever their cameras send. Raising the output to 120Hz doubles the budget at
+no CPU cost, which is why a high-refresh mode is worth choosing here.
+
+`compositor` blends the whole wall into one frame and scans it out through a
+single `kmssink` on a single plane, so one commit carries every viewport and
+each tile is limited by its own feed rather than by its share of the commit
+budget. It costs a CPU blend of the full output frame.
+
+Measured on a Pi 5 at 1920x1080, nine feeds of 640x360 (15-30 fps sources):
+
+| | `kms-planes` @120Hz | `compositor` @60Hz |
+|---|---|---|
+| per viewport | 13.4 fps, uniform | 13.7-29.9 fps, each at its camera's rate |
+| CPU | ~42% of one core | ~60% of one core |
+| planes used | one per viewport | one per display |
+
+The compositor's cost scales with output resolution and refresh, not with the
+number of viewports: at 120Hz it blends twice as many frames for no visible
+gain once every camera is already showing every frame it sends. Pair it with a
+60Hz mode. Capping the blend rate below the refresh was measured and changes
+nothing at 60Hz, so there is no setting for it.
+
+`kms-planes` remains the default: it is the zero-copy path, it needs less CPU,
+and it is what the Pi 3 wall has run on. The compositor has not been measured
+on a Pi 3.
+
+Two settings behave differently under the two backends. `drm.background =
+"none"` is refused with `compositor`, because a full-screen composited frame
+leaves no console to show through. And the compositor wants a *lower* refresh
+rate than `kms-planes`: see `mode` below.
 
 ### Metrics
 
@@ -399,7 +437,8 @@ output path would all port. Three things currently tie it to a Pi:
 - Decoder selection prefers the Pi's V4L2 M2M decoders. H.264 falls back to
   software `avdec_h264`, so it would run on x86 but on the CPU; there is no
   VAAPI or NVDEC path.
-- A wall needs one overlay plane per viewport. Intel and AMD display engines
+- A wall on the default `kms-planes` backend needs one overlay plane per
+  viewport (`compositor` needs one per display instead). Intel and AMD display engines
   typically expose far fewer than the nine a 3x3 wall wants.
 
 Supporting x86 properly would mean replacing the `kmsprint` shell-out with

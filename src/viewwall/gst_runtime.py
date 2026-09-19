@@ -109,8 +109,13 @@ class ViewportRuntime:
     aspect: Any
     valve: Any
     output_queue: Any
+    # Both None under the compositor, where one sink serves the display and
+    # a viewport owns a mixer pad rather than a plane.
     sink: Any
-    plane_id: int
+    plane_id: int | None
+    # The compositor sink pad carrying this viewport's rectangle. Requested at
+    # startup and never released -- see _build_composited_viewports().
+    mixer_pad: Any = None
     sink_generation: int = 0
     selector_pads: dict[str, Any] = field(default_factory=dict)
     branch_crops: dict[str, Any] = field(default_factory=dict)
@@ -202,6 +207,12 @@ class WallRuntime:
     TILE_SLOW_SECONDS = 30.0
     FATAL_COOLDOWN_SECONDS = 600.0
     MIN_STALL_TIMEOUT_MS = 5_000
+    # Set in __init__. Declared here as None, not False, so a code path that
+    # reads it on a half-built runtime raises rather than silently taking the
+    # kms-planes branch -- the failure mode that would put the plane-budget
+    # check back to asking for one plane per viewport under the compositor.
+    compositing: bool = None  # type: ignore[assignment]
+
     FEED_STALL_TIMEOUT_MS = 15_000
     FEED_STABLE_SECONDS = 60
     RETRY_DELAYS_SECONDS = (1, 2, 5, 10, 30)
@@ -212,12 +223,18 @@ class WallRuntime:
         displays: Mapping[str, DisplayState] | None = None,
     ) -> None:
         self.config = config
-        demand = {
+        self.compositing = config.drm.output_backend == "compositor"
+        # The compositor blends every viewport into one frame, so a display
+        # needs a single plane however many viewports it carries; kms-planes
+        # needs one each. A display with no viewports is still an error under
+        # both, which is why the count is taken before it is collapsed.
+        viewport_counts = {
             display.name: len(config.viewports_for(display))
             for display in config.displays
         }
+        demand = self._plane_demand(viewport_counts)
         for display in config.displays:
-            if demand[display.name] == 0:
+            if viewport_counts[display.name] == 0:
                 raise RuntimeDependencyError(
                     f"display {display.name} has no viewports; remove it or give "
                     "it one"
@@ -254,6 +271,15 @@ class WallRuntime:
         self.feeds: dict[str, FeedRuntime] = {}
         self.viewports: dict[str, ViewportRuntime] = {}
         self.background_sinks: dict[str, Any] = {}
+        # The compositor backend's one sink per display, and the counters its
+        # composited-rate metric reads across intervals.
+        self.composited_sinks: dict[str, Any] = {}
+        # The capsfilter between compositor and sink, per display. Kept so a
+        # mode change can retarget it: it pins the output size, and left at
+        # the old one the compositor keeps producing the previous resolution
+        # into a sink whose destination rect has already moved.
+        self.composited_caps: dict[str, Any] = {}
+        self._composited_totals: dict[str, tuple[int, int]] = {}
         self._feed_bins: dict[str, tuple[str, int]] = {}
         self._retired_feed_bins: dict[str, Any] = {}
         self._stopping = False
@@ -268,6 +294,30 @@ class WallRuntime:
             # the DRM fd, so let it run rather than relying on that.
             self.close()
             raise
+
+    def _plane_demand(
+        self, viewport_counts: Mapping[str, int] | None = None
+    ) -> dict[str, int]:
+        """How many overlay planes each display needs.
+
+        One rule, one owner: the display poll re-probes on every resolution
+        change and asked for one plane per viewport regardless of backend,
+        which under the compositor is nine planes it never uses -- enough to
+        fail the probe outright on a Pi 3, where five is the practical limit.
+
+        The compositor blends every viewport into one frame and scans it out
+        on a single plane, so a display needs one however many viewports it
+        carries. kms-planes needs one each.
+        """
+        if viewport_counts is None:
+            viewport_counts = {
+                display.name: len(self.config.viewports_for(display))
+                for display in self.config.displays
+            }
+        return {
+            name: (1 if self.compositing and count else count)
+            for name, count in viewport_counts.items()
+        }
 
     def _apply_configured_modes(self) -> None:
         """Lay out against the configured mode rather than the probed one.
@@ -285,7 +335,7 @@ class WallRuntime:
             state = self.displays.get(display.name)
             if state is None:
                 continue
-            width, height = display.mode  # type: ignore[misc]
+            width, height = display.mode
             if (state.width, state.height) == (width, height):
                 continue
             # Refuse a mode the display does not advertise. kmssink would
@@ -435,6 +485,10 @@ class WallRuntime:
         """
         colour = self.config.drm.background
         modes = {d.name for d in self.config.displays if d.mode is not None}
+        if self.compositing:
+            # Nothing for this sink to do there: the background is a pad
+            # beneath the viewports, and nothing else here needs a modeset.
+            return
         # The same sink serves both jobs. Painting needs a colour; setting a
         # mode needs only the modeset, so a display naming one is built even
         # with the background off, and simply paints black behind tiles that
@@ -483,6 +537,12 @@ class WallRuntime:
             # sets the connector's mode when one is configured. state.width
             # and state.height already carry it: _apply_mode() replaced the
             # probed values before any of this was built.
+            # A named refresh rate goes in as the caps framerate, because that
+            # is the only thing kmssink matches a mode against: a panel
+            # offering 1920x1080 at 120, 60, 50, 30 and 24 otherwise gives
+            # whichever the driver resolves first. With no rate named, 1/2 is
+            # kept -- one still frame every two seconds is all a background
+            # needs, and it leaves the choice of mode to the driver.
             filt.set_property(
                 "caps",
                 self.Gst.Caps.from_string(
@@ -499,7 +559,202 @@ class WallRuntime:
                 f"background {colour}" if colour is not None else "modeset only",
             )
 
+    def _new_compositor(self, display_name: str, state: Any) -> Any:
+        """One compositor and one kmssink for a whole display.
+
+        Built once per display and never rebuilt. Feed recovery happens
+        upstream of each viewport's input-selector, so a branch can be torn
+        down and rebuilt without any compositor pad being released -- which is
+        what keeps the other viewports from renegotiating, flushing, or
+        blanking while one feed comes back.
+        """
+        safe = display_name.replace("-", "_")
+        compositor = self._element("compositor", f"compositor_{safe}")
+        # The wall is live: composite whatever has arrived when the deadline
+        # passes rather than waiting for a stalled input. Measured with one
+        # input valved off for 5s, the other eight held their full rate.
+        self._set_if_present(compositor, "latency", 100_000_000)
+        # Gaps, margin and dead tiles are pixels in the composited frame, so
+        # drm.background is painted here rather than by a separate sink. The
+        # compositor's own "background" offers only black, white and
+        # transparent, so an arbitrary colour needs a solid-colour pad.
+        caps = self._element("capsfilter", f"compositor_caps_{safe}")
+        caps.set_property(
+            "caps",
+            self.Gst.Caps.from_string(
+                # I420 straight to the plane: the VC4 takes it natively
+                # (kmsprint shows the fb as YU12), so nothing converts.
+                f"video/x-raw,format=I420,width={state.width},height={state.height}"
+            ),
+        )
+        sink = self._element("kmssink", f"kms_{safe}")
+        sink.set_property("fd", self.drm_fd)
+        # Neither plane-id nor force-modesetting, unlike the per-viewport
+        # sinks. Measured on a Pi 5, every combination including either one
+        # left the CRTC with no framebuffer attached -- black screen, no error
+        # from kmssink, every tile still reporting its full rate:
+        #
+        #   plane-id, no modeset -> plane 107, black
+        #   plane-id, modeset    -> plane 107, black
+        #   neither,  modeset    -> plane  83, black
+        #   neither,  neither    -> plane 107, WORKS
+        #
+        # So kmssink picks its own overlay above a CRTC something else lit,
+        # which is what the nine per-viewport sinks do under kms-planes.
+        self._set_if_present(sink, "force-aspect-ratio", False)
+        self._set_if_present(sink, "skip-vsync", True)
+        sink.set_property("async", False)
+        # sync=false, unlike the per-viewport sinks: the compositor has
+        # already paced these frames, emitting one when its deadline passes
+        # with whatever arrived. Timing them again here made basesink judge
+        # them late -- composited_fps fell to 2.8-4.6 with ~1600 dropped a
+        # minute while every tile still delivered its full rate.
+        sink.set_property("sync", False)
+        # Same reasoning as the per-viewport sinks: QoS events reach the
+        # decoders and make them drop before decoding.
+        self._set_if_present(sink, "qos", False)
+        chain = (compositor, caps, sink)
+        self._add(*chain)
+        self._link_many(*chain)
+        self.composited_sinks[display_name] = sink
+        self.composited_caps[display_name] = caps
+
+        # Never None here: load_config refuses drm.background = "none" for
+        # this backend, because there is no console left behind a
+        # full-screen composited frame for it to show through.
+        colour = self.config.drm.background
+        self._set_object_arg_if_present(compositor, "background", "black")
+        source = self._element("videotestsrc", f"compositor_bg_src_{safe}")
+        source.set_property("pattern", "solid-color")
+        source.set_property("is-live", True)
+        # Same 0xAARRGGBB convention as _build_background(): a zero alpha byte
+        # reads as fully transparent, so the colour has to carry one.
+        source.set_property("foreground-color", 0xFF000000 | int(colour[1:], 16))
+        bg_caps = self._element("capsfilter", f"compositor_bg_caps_{safe}")
+        # No framerate: compositor emits at its slowest input's rate, so the
+        # 1/2 _build_background() uses throttled the whole wall to 0.5 fps.
+        # Unfixed, the background follows the viewports.
+        bg_caps.set_property(
+            "caps",
+            self.Gst.Caps.from_string(
+                f"video/x-raw,format=I420,width={state.width},"
+                f"height={state.height}"
+            ),
+        )
+        self._add(source, bg_caps)
+        self._link_many(source, bg_caps)
+        bg_pad = compositor.request_pad_simple("sink_%u")
+        if bg_pad is None:
+            raise RuntimeDependencyError(
+                f"compositor refused a background pad for display {display_name}"
+            )
+        # Explicitly beneath every viewport: pads are otherwise composited in
+        # request order, and the background is requested first only by
+        # construction.
+        self._set_if_present(bg_pad, "zorder", 0)
+        bg_src = bg_caps.get_static_pad("src")
+        if bg_src is None or bg_src.link(bg_pad) != self.Gst.PadLinkReturn.OK:
+            raise RuntimeDependencyError(
+                f"could not link the background for display {display_name}"
+            )
+        return compositor
+
+    def _build_composited_viewports(self) -> None:
+        """Every viewport on a display feeds one compositor pad.
+
+        The per-viewport chain up to the output queue is the same as under
+        kms-planes -- selector, valve, capssetter, queue -- so feed recovery,
+        rotation and the tile-quiet probe are untouched. Only what the queue
+        feeds changes: a requested compositor pad carrying the viewport's
+        rectangle, instead of that viewport's own kmssink.
+        """
+        compositors: dict[str, Any] = {}
+        for viewport_config in self.config.viewports:
+            safe = viewport_config.name.replace("-", "_")
+            display_name = viewport_config.display
+            state = self.displays[display_name]
+            if display_name not in compositors:
+                compositors[display_name] = self._new_compositor(display_name, state)
+            compositor = compositors[display_name]
+
+            selector = self._element("input-selector", f"selector_{safe}")
+            aspect = self._element("capssetter", f"aspect_{safe}")
+            # Force square pixels on every feed. A Unifi G3 Dome declares
+            # pixel-aspect-ratio 189/190, so its 640 columns display as 636.6
+            # and the compositor letterboxes the difference as a black strip
+            # down that tile. Pad geometry already places the source, so a
+            # camera's PAR has nothing left to say.
+            aspect.set_property(
+                "caps", self.Gst.Caps.from_string("video/x-raw,pixel-aspect-ratio=1/1")
+            )
+            queue = self._element("queue", f"output_queue_{safe}")
+            valve = self._element("valve", f"valve_{safe}")
+            self._set_if_present(selector, "sync-streams", False)
+            self._set_if_present(selector, "cache-buffers", True)
+            self._set_if_present(selector, "drop-backwards", True)
+            queue.set_property("max-size-buffers", 32)
+            queue.set_property("max-size-bytes", 0)
+            queue.set_property("max-size-time", 0)
+            # Not leaky, unlike kms-planes, where a per-viewport sink pulls
+            # at the CRTC rate and dropping the oldest frame bounds latency.
+            # One mixer on its own deadline makes a full queue leak
+            # continuously instead: measured at 1920x1080@24 with 30fps feeds,
+            # tiles fell from 24 fps to 5. The mixer already drops what it
+            # cannot use.
+            self.Gst.util_set_object_arg(queue, "leaky", "no")
+            valve.set_property("drop", True)
+            self._set_object_arg_if_present(
+                valve, "drop-mode", "forward-sticky-events"
+            )
+
+            chain = (selector, valve, aspect, queue)
+            self._add(*chain)
+            self._link_many(*chain)
+
+            # Requested once and never released: recovery happens upstream of
+            # the selector, and releasing here would make the compositor
+            # renegotiate every other viewport. sink_%u rather than a computed
+            # index, since the background may already hold sink_0.
+            pad = compositor.request_pad_simple("sink_%u")
+            if pad is None:
+                raise RuntimeDependencyError(
+                    f"compositor refused a pad for viewport {viewport_config.name}"
+                )
+            # Above the background pad, which sits at zorder 0.
+            self._set_if_present(pad, "zorder", 1)
+            queue_src = queue.get_static_pad("src")
+            if queue_src is None or queue_src.link(pad) != self.Gst.PadLinkReturn.OK:
+                raise RuntimeDependencyError(
+                    f"could not link viewport {viewport_config.name} to the compositor"
+                )
+
+            # The tile-quiet probe, on the compositor pad rather than the
+            # queue's src pad. Same semantics, and this pad outlives every
+            # feed rebuild, so recovery cannot lose it the way replacing a
+            # per-viewport sink once did.
+            pad.add_probe(
+                self.Gst.PadProbeType.BUFFER,
+                self._on_viewport_buffer,
+                viewport_config.name,
+            )
+
+            runtime = ViewportRuntime(
+                config=viewport_config,
+                display_name=display_name,
+                selector=selector,
+                aspect=aspect,
+                valve=valve,
+                output_queue=queue,
+                sink=None,
+                plane_id=None,
+                mixer_pad=pad,
+            )
+            self.viewports[viewport_config.name] = runtime
+
     def _build_viewports(self) -> None:
+        if self.compositing:
+            self._build_composited_viewports()
+            return
         next_plane = {name: 0 for name in self.displays}
         for viewport_config in self.config.viewports:
             safe = viewport_config.name.replace("-", "_")
@@ -599,7 +854,13 @@ class WallRuntime:
             decode_queue.set_property("max-size-buffers", 8)
             decode_queue.set_property("max-size-bytes", 0)
             decode_queue.set_property("max-size-time", 0)
-            self.Gst.util_set_object_arg(decode_queue, "leaky", "downstream")
+            # Not leaky under the compositor, the last of three queues that
+            # each turn back-pressure into compounding loss there: with 90fps
+            # sources into a 60Hz output, nine tiles ran at 60.4 fps clean and
+            # 14.8 with only this one leaking. kms-planes keeps the leak.
+            self.Gst.util_set_object_arg(
+                decode_queue, "leaky", "no" if self.compositing else "downstream"
+            )
 
             self._add(decode_queue, tee)
             self._link_many(decode_queue, tee)
@@ -1098,7 +1359,8 @@ class WallRuntime:
                 lambda pad, info: self.Gst.PadProbeReturn.OK,
             )
 
-        for element in (old_queue, old_crop):
+        branch_elements = (old_queue, old_crop)
+        for element in branch_elements:
             element.set_locked_state(True)
             if element.set_state(self.Gst.State.NULL) == self.Gst.StateChangeReturn.FAILURE:
                 raise RuntimeDependencyError(f"could not stop {element.get_name()}")
@@ -1111,7 +1373,7 @@ class WallRuntime:
         old_crop.get_static_pad("src").unlink(old_pad)
         viewport.selector.release_request_pad(old_pad)
         old_queue.unlink(old_crop)
-        for element in (old_queue, old_crop):
+        for element in branch_elements:
             if not self.pipeline.remove(element):
                 raise RuntimeDependencyError(f"could not remove {element.get_name()}")
 
@@ -1122,10 +1384,8 @@ class WallRuntime:
         self._apply_viewport_crop(viewport)
         # Built into a pipeline that is already PLAYING, unlike the initial
         # branches, so the new elements have to be brought up to meet it.
-        for element in (
-            viewport.branch_queues[feed_name],
-            viewport.branch_crops[feed_name],
-        ):
+        rebuilt = [viewport.branch_queues[feed_name], viewport.branch_crops[feed_name]]
+        for element in rebuilt:
             if not element.sync_state_with_parent():
                 raise RuntimeDependencyError(
                     f"could not start {element.get_name()}"
@@ -1381,13 +1641,20 @@ class WallRuntime:
         queue.set_property("max-size-buffers", 4)
         queue.set_property("max-size-bytes", 0)
         queue.set_property("max-size-time", 0)
-        self.Gst.util_set_object_arg(queue, "leaky", "downstream")
+        # Not leaky under the compositor, for the same reason the output
+        # queue is not: measured with 90fps sources into a 60Hz output, nine
+        # tiles ran at 60.3 fps each clean and 2.7 with this queue leaking.
+        self.Gst.util_set_object_arg(
+            queue, "leaky", "no" if self.compositing else "downstream"
+        )
         self.pipeline.add(queue)
 
-        # One videocrop per branch, before the selector. It sees a
-        # single decoder's caps for the lifetime of the branch, so the
-        # cropped caps kmssink sizes its pool from never change and a
-        # rotating viewport keeps its seam and its 1:1 plane.
+        # One per branch, on both backends: it sees a single decoder's caps
+        # for the branch's lifetime, so a rotating viewport keeps its seam.
+        # The gap is cut from the source rather than drawn over the output, so
+        # a 640x360 feed lands 1:1 in a 639x359 destination. Letting the
+        # destination be a pixel smaller instead is a resize of every frame:
+        # measured on a Pi 5, that took the wall from 58% of a core to 127%.
         crop = self._element(
             "videocrop", f"crop_{safe_feed}_to_{safe_viewport}{suffix}"
         )
@@ -1435,11 +1702,17 @@ class WallRuntime:
                 viewport.selector.set_property(
                     "active-pad", viewport.selector_pads[feed_name]
                 )
-                viewport.sink.set_locked_state(False)
-                if not viewport.sink.sync_state_with_parent():
-                    raise RuntimeDependencyError(
-                        f"could not prime KMS plane for viewport {viewport.config.name}"
-                    )
+                # Under the compositor there is no per-viewport sink to
+                # unlock: the one sink for the display is already running and
+                # the tile simply starts receiving buffers again.
+                if viewport.mixer_pad is not None:
+                    viewport.mixer_pad.set_property("alpha", 1.0)
+                if viewport.sink is not None:
+                    viewport.sink.set_locked_state(False)
+                    if not viewport.sink.sync_state_with_parent():
+                        raise RuntimeDependencyError(
+                            f"could not prime KMS plane for viewport {viewport.config.name}"
+                        )
                 viewport.valve.set_property("drop", False)
 
     def _activate_viewport_feed(self, viewport: ViewportRuntime, index: int) -> None:
@@ -1456,10 +1729,16 @@ class WallRuntime:
         # the selector forwards already carry the right pixel aspect ratio.
         self._apply_viewport_aspect(viewport, self.feeds[feed_name].source_size)
         viewport.selector.set_property("active-pad", viewport.selector_pads[feed_name])
-        viewport.sink.set_locked_state(False)
-        if not viewport.sink.sync_state_with_parent():
-            self._fatal(f"could not enable KMS plane for viewport {viewport.config.name}")
-            return
+        if viewport.mixer_pad is not None:
+            # Back into the blend; _show_viewport_offline() took it out.
+            viewport.mixer_pad.set_property("alpha", 1.0)
+        if viewport.sink is not None:
+            viewport.sink.set_locked_state(False)
+            if not viewport.sink.sync_state_with_parent():
+                self._fatal(
+                    f"could not enable KMS plane for viewport {viewport.config.name}"
+                )
+                return
         # The valve stays open from here on. A closed valve would block the
         # newly selected branch's ALLOCATION query from reaching kmssink.
         viewport.valve.set_property("drop", False)
@@ -1556,7 +1835,14 @@ class WallRuntime:
     def _show_viewport_offline(self, viewport: ViewportRuntime) -> None:
         was_active = viewport.active_feed is not None
         viewport.valve.set_property("drop", True)
-        if was_active:
+        if viewport.mixer_pad is not None:
+            # Closing the valve stops new buffers, but the compositor keeps
+            # blending the last one it received into every output frame, so
+            # the tile froze on the dead camera's final picture -- which reads
+            # as a working camera, worse than a black tile. Alpha 0 takes the
+            # pad out of the blend and lets the background through.
+            viewport.mixer_pad.set_property("alpha", 0.0)
+        if was_active and viewport.sink is not None:
             # A kmssink cannot be restarted once it has been to NULL: it
             # fails the next PLAYING with "Could not open DRM module".
             # Replace the spent instance so a recovered feed can reuse the
@@ -1572,9 +1858,12 @@ class WallRuntime:
         # Name the feeds rather than only the viewport: this is the message that
         # says a camera went dark, and "viewport 3" alone does not say which.
         LOG.info(
-            "viewport %d (%s): no healthy feed; KMS plane disabled",
+            "viewport %d (%s): no healthy feed; %s",
             viewport.config.index,
             ", ".join(viewport.config.feeds),
+            "tile shows the background"
+            if viewport.sink is None
+            else "KMS plane disabled",
         )
 
     def _next_healthy_feed_index(self, viewport: ViewportRuntime) -> int | None:
@@ -1777,6 +2066,15 @@ class WallRuntime:
         viewport: ViewportRuntime,
         source_size: tuple[int, int] | None,
     ) -> None:
+        """Stretch a source to its tile by telling kmssink its pixels are not square.
+
+        Not used under the compositor, where pad geometry already scales the
+        source and a PAR on top of it applies twice: a 480x360 source with PAR
+        4/3 into a 640-wide pad came out 853 wide. That capssetter is pinned
+        to square pixels at build time instead.
+        """
+        if self.compositing:
+            return
         if viewport.resolved is None or viewport.crop_values is None or source_size is None:
             return
         source_width = (
@@ -1822,6 +2120,37 @@ class WallRuntime:
             if display_name is not None and display_config.name != display_name:
                 continue
             state = self.displays[display_config.name]
+            composited = self.composited_sinks.get(display_config.name)
+            if composited is not None:
+                # The composited sink covers the whole output, so its render
+                # rectangle is the display rather than a tile. Set explicitly
+                # rather than left to kmssink's own derivation from caps: that
+                # derivation happens once, and a later mode change leaves the
+                # plane's *destination* rect at the old size while the buffer
+                # follows the new one. Measured switching 1920x1080 ->
+                # 1280x720, the plane read "0,0 1280x720 -> 0,0 1920x1080" and
+                # the wall showed its top-left quarter blown up to fill the
+                # screen.
+                if not self.GstVideo.VideoOverlay.set_render_rectangle(
+                    composited, 0, 0, state.width, state.height
+                ):
+                    raise RuntimeDependencyError(
+                        f"composited sink for display {display_config.name} "
+                        "rejected its render rectangle"
+                    )
+                # The caps move with it. The rectangle says where the buffer
+                # lands; this says how big the buffer is, and a mode change
+                # that moved only one of them left the compositor producing
+                # the old resolution into the new rect.
+                caps = self.composited_caps.get(display_config.name)
+                if caps is not None:
+                    caps.set_property(
+                        "caps",
+                        self.Gst.Caps.from_string(
+                            f"video/x-raw,format=I420,"
+                            f"width={state.width},height={state.height}"
+                        ),
+                    )
             viewports = self.config.viewports_for(display_config)
             resolved = resolve_layout(
                 viewports,
@@ -1834,7 +2163,16 @@ class WallRuntime:
                 viewport = self.viewports[name]
                 viewport.resolved = resolved[name]
                 rect = viewport.resolved.render
-                if not self.GstVideo.VideoOverlay.set_render_rectangle(
+                if viewport.mixer_pad is not None:
+                    # The compositor places the tile by pad properties rather
+                    # than by a render rectangle: same numbers, and it is the
+                    # only thing that moves when a mode changes, since the pad
+                    # itself is never re-requested.
+                    viewport.mixer_pad.set_property("xpos", rect.x)
+                    viewport.mixer_pad.set_property("ypos", rect.y)
+                    viewport.mixer_pad.set_property("width", rect.width)
+                    viewport.mixer_pad.set_property("height", rect.height)
+                elif not self.GstVideo.VideoOverlay.set_render_rectangle(
                     viewport.sink, rect.x, rect.y, rect.width, rect.height
                 ):
                     raise RuntimeDependencyError(
@@ -1849,13 +2187,15 @@ class WallRuntime:
                 LOG.info(
                     # The display is worth naming only when there is a choice
                     # of them; on one screen it repeats on every line.
-                    "viewport %d (%s): %splane=%d rectangle=%d,%d %dx%d",
+                    "viewport %d (%s): %s%srectangle=%d,%d %dx%d",
                     viewport_config.index,
                     ", ".join(viewport_config.feeds),
                     ""
                     if len(self.config.displays) == 1
                     else f"display={display_config.name} ",
-                    viewport.plane_id,
+                    ""
+                    if viewport.plane_id is None
+                    else f"plane={viewport.plane_id} ",
                     rect.x,
                     rect.y,
                     rect.width,
@@ -1899,10 +2239,7 @@ class WallRuntime:
                 if display.name not in pinned
             ):
                 return True
-        demand = {
-            display.name: len(self.config.viewports_for(display))
-            for display in self.config.displays
-        }
+        demand = self._plane_demand()
         try:
             current = detect_displays(self.config.displays, demand)
         except Exception as exc:  # a disconnected display should not terminate active streams
@@ -2227,9 +2564,27 @@ class WallRuntime:
             # planes share 60 updates a second however fast the decoders run.
             # Reported next to fps so the two can be compared directly: a wide
             # gap is the plane path, not the network or the decoder.
-            presented = self._sink_presented(viewport.sink)
+            # Under the compositor a viewport has no sink of its own: one sink
+            # serves the display, and its counters are the whole wall's, not
+            # this tile's. The tile's own rate is what its compositor pad
+            # accepted, which the pad probe already counts -- and because the
+            # compositor blends whatever has arrived at its deadline, a buffer
+            # reaching the pad is a buffer composited into the next frame.
+            # The sink's own rate is reported once per display instead, below.
+            # queued, not output_total: both count the same buffers, but
+            # queued is zeroed against this window while output_total runs for
+            # the life of the viewport. Dividing a lifetime total by a window
+            # shortened by a rotation reported 367 fps for a tile receiving 28.
+            # No presented rate per viewport under the compositor: the tiles
+            # share one sink, whose counters are the whole wall's, and what
+            # this viewport handed the compositor is already queued_fps below.
+            # Reporting the same number twice under two names said nothing.
+            # _report_composited_rate() gives the rate that reaches the panel.
             presented_fps: float | None = None
             dropped_delta: int | None = None
+            presented = (
+                None if self.compositing else self._sink_presented(viewport.sink)
+            )
             if presented is not None:
                 total, dropped = presented
                 # A replaced sink starts its counters again, so a total below
@@ -2262,8 +2617,40 @@ class WallRuntime:
             LOG.info("metrics %s", format_fields(fields), extra=fields)
             if queued:
                 showing += 1
+        self._report_composited_rate(elapsed)
         self._report_wall_health(showing)
         return True
+
+    def _report_composited_rate(self, elapsed: float) -> None:
+        """What the one sink actually scanned out, per display.
+
+        The compositor backend only. Its viewports share a sink, so there is
+        no per-tile presented rate to report: the per-viewport lines say what
+        each tile handed the compositor, and this says what reached the panel.
+        """
+        if not self.compositing or elapsed <= 0:
+            return
+        for display_name, sink in self.composited_sinks.items():
+            presented = self._sink_presented(sink)
+            if presented is None:
+                continue
+            total, dropped = presented
+            previous_total, previous_dropped = self._composited_totals.get(
+                display_name, (0, 0)
+            )
+            self._composited_totals[display_name] = (total, dropped)
+            if total < previous_total or dropped < previous_dropped:
+                # A restarted sink zeroes both counters; a delta taken across
+                # that is meaningless for either one.
+                continue
+            fields = {
+                "VW_DISPLAY": display_name,
+                "VW_COMPOSITED_FPS": f"{(total - previous_total) / elapsed:.1f}",
+            }
+            dropped_delta = dropped - previous_dropped
+            if dropped_delta > 0:
+                fields["VW_SINK_DROPPED"] = str(dropped_delta)
+            LOG.info("metrics %s", format_fields(fields), extra=fields)
 
     def _report_wall_health(self, showing: int) -> None:
         """Say so when the whole wall goes dark, and when it comes back.
