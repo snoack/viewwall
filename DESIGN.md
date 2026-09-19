@@ -158,6 +158,19 @@ deliberately longer than the stall watchdog so that a feed-side stall reaches
 the watchdog first and replaces the feed bin, rather than both firing and
 rebuilding a branch under a feed that is already being replaced.
 
+A tile can also fail without ever going quiet. Observed in production: a
+viewport passing about one frame every three seconds from a feed decoding
+thirty, for two hours, while the stall watchdog saw a decoder running at full
+rate and the quiet check saw a buffer arrive every few seconds. Both reported
+healthy throughout. So the same poll also compares what reaches a tile against
+what its feed decodes, and a viewport under `TILE_RATE_FLOOR` of that for
+`TILE_SLOW_SECONDS` has its branch rebuilt. The comparison is a ratio because
+the feeds differ -- fifteen fps is healthy for one camera and a collapse for
+another -- and healthy is parity: every static viewport reports the two equal
+to the first decimal. A feed decoding nothing falls out of the same comparison
+rather than needing a guard, so a camera that is merely off cannot mature into
+a rebuild.
+
 An earlier version counted consecutive short generations and read RTP packet
 counters to answer the third question. It twice read a real wedge as an outage
 in production and escalated nothing: the counters were sampled on a timer, and

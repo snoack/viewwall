@@ -81,6 +81,9 @@ class FeedRuntime:
     last_frame_at: float | None = None
     max_frame_gap: float | None = None
     decoded_frames: int = 0
+    # The same frames, kept for rate comparison: decoded_frames is zeroed by
+    # the metrics report and cannot be differenced from another timer.
+    decoded_total: int = 0
     healthy_at: float | None = None
     branches_rebuilt: bool = False
     # When this feed last took the wall down, so a repeat cannot loop on it.
@@ -120,6 +123,20 @@ class ViewportRuntime:
     crop_values: SourceCrop | None = None
     pixel_aspect_ratio: Fraction | None = None
     queued_frames: int = 0
+    # Buffers that have reached this viewport's output queue, ever. Separate
+    # from queued_frames because _report_metrics() zeroes that one on its own
+    # timer, and a rate read from a different timer would see a partial count.
+    output_total: int = 0
+    # When this tile was last passing a sane share of what its feed decodes,
+    # so a collapse has to persist before it is acted on.
+    keeping_up_at: float | None = None
+    # The totals read at the previous poll, so each tick measures an interval
+    # rather than a lifetime.
+    rate_sample: tuple[int, int] | None = None
+    # The most recent interval's counts, carried only so the log line can name
+    # what was seen without recomputing it.
+    rate_shown: int = 0
+    rate_decoded: int = 0
     # When a buffer last reached this viewport's output queue, so a tile that
     # goes quiet under a healthy feed can be told from one that never started.
     last_output_at: float | None = None
@@ -174,6 +191,15 @@ class WallRuntime:
     # and replace the feed bin, rather than both firing and rebuilding a
     # branch under a feed that is already being replaced.
     TILE_QUIET_SECONDS = 20.0
+    # A tile passing less than this share of what its feed decodes is not
+    # showing that camera in any useful sense. Healthy is parity: measured on
+    # this wall, every static viewport reports queued and decoded rates equal
+    # to the first decimal. The fault this catches ran at about 1%.
+    TILE_RATE_FLOOR = 0.25
+    # How long that has to hold before the branch is rebuilt. Long enough to
+    # outlast a rotation, a backoff and a reconnect, so only a sustained
+    # collapse qualifies.
+    TILE_SLOW_SECONDS = 30.0
     FATAL_COOLDOWN_SECONDS = 600.0
     MIN_STALL_TIMEOUT_MS = 5_000
     FEED_STALL_TIMEOUT_MS = 15_000
@@ -916,6 +942,25 @@ class WallRuntime:
             # that case.
             if feed is None or feed.state != "healthy":
                 continue
+            if self._tile_falling_behind(viewport, feed, now):
+                # Loud on purpose, and said before the repair rather than
+                # after: this rung has never fired in production, so the next
+                # occurrence has to show what was seen, what was done, and
+                # whether it helped.
+                LOG.error(
+                    "viewport %d: %d of the %d frames feed %s decoded reached "
+                    "the screen in the last interval, under %.0f%% for %.0fs, "
+                    "so the branch between them is at fault. Rebuilding it",
+                    viewport.config.index,
+                    viewport.rate_shown,
+                    viewport.rate_decoded,
+                    feed_name,
+                    self.TILE_RATE_FLOOR * 100,
+                    now - (viewport.keeping_up_at or now),
+                )
+                viewport.keeping_up_at = now
+                self._rebuild_one_branch_safely(viewport, feed_name)
+                continue
             last = viewport.last_output_at
             if last is None or now - last < self.TILE_QUIET_SECONDS:
                 continue
@@ -930,6 +975,43 @@ class WallRuntime:
             )
             self._rebuild_one_branch_safely(viewport, feed_name)
         return True
+
+    def _tile_falling_behind(
+        self, viewport: ViewportRuntime, feed: FeedRuntime, now: float
+    ) -> bool:
+        """Say whether a tile is showing far less than its feed decodes.
+
+        The stall watchdog sits after the decoder and the quiet test asks only
+        whether any buffer arrived, so a viewport passing a trickle satisfies
+        both indefinitely. Observed in production: a tile rendering about one
+        frame every three seconds from a feed decoding thirty, for two hours,
+        with every existing signal reporting healthy.
+
+        Compared as a ratio rather than an absolute rate because the feeds
+        differ: fifteen fps is healthy for one camera and a collapse for
+        another. Healthy is parity -- every static viewport on this wall
+        reports the two equal to the first decimal.
+        """
+        previous = viewport.rate_sample
+        viewport.rate_sample = (viewport.output_total, feed.decoded_total)
+        if previous is None:
+            viewport.keeping_up_at = now
+            return False
+        shown = viewport.output_total - previous[0]
+        decoded = feed.decoded_total - previous[1]
+        viewport.rate_shown = shown
+        viewport.rate_decoded = decoded
+        # A feed decoding nothing falls out here rather than in a guard of its
+        # own: the comparison reads 0 >= 0 and resets the dwell, so a camera
+        # that is merely off can never mature into a rebuild. That case belongs
+        # to the stall watchdog, which sits after the decoder.
+        if shown >= decoded * self.TILE_RATE_FLOOR:
+            viewport.keeping_up_at = now
+            return False
+        if viewport.keeping_up_at is None:
+            viewport.keeping_up_at = now
+            return False
+        return now - viewport.keeping_up_at >= self.TILE_SLOW_SECONDS
 
     def _rebuild_one_branch_safely(
         self, viewport: ViewportRuntime, feed_name: str
@@ -1207,6 +1289,7 @@ class WallRuntime:
         if feed.generation != generation:
             return self.Gst.PadProbeReturn.OK
         feed.decoded_frames += 1
+        feed.decoded_total += 1
         if feed.observed_fps_applied or feed.caps_fps_known:
             # A declared framerate is authoritative; measuring on top of it
             # would let a startup hiccup loosen a fast feed's watchdog.
@@ -1989,6 +2072,7 @@ class WallRuntime:
         viewport = self.viewports.get(viewport_name)
         if viewport is not None:
             viewport.queued_frames += 1
+            viewport.output_total += 1
             now = time.monotonic()
             viewport.last_output_at = now
             if viewport.switched_at is not None:

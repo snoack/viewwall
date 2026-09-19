@@ -921,6 +921,7 @@ def _observed_feed() -> object:
         caps_fps_known=False,
         watchdog_reported=False,
         decoded_frames=0,
+        decoded_total=0,
         generation=0,
     )
 
@@ -1485,6 +1486,7 @@ def test_the_first_frame_after_a_switch_is_timed(monkeypatch, caplog) -> None:
         config=SimpleNamespace(index=9),
         active_feed="coop",
         queued_frames=0,
+        output_total=0,
         last_output_at=None,
         switched_at=100.0,
     )
@@ -1511,13 +1513,89 @@ def _tile_runtime(last_output_at, feed_state="healthy"):
         config=SimpleNamespace(index=1),
         active_feed="cam",
         last_output_at=last_output_at,
+        output_total=0,
+        rate_sample=None,
+        keeping_up_at=None,
+        rate_shown=0,
+        rate_decoded=0,
     )
     runtime.viewports = {"v1": viewport}
-    runtime.feeds = {"cam": SimpleNamespace(state=feed_state)}
+    runtime.feeds = {"cam": SimpleNamespace(state=feed_state, decoded_total=0)}
     runtime._rebuild_one_branch_safely = (  # type: ignore[method-assign]
         lambda vp, name: runtime.rebuilt.append(name)
     )
     return runtime, viewport
+
+
+def _rate_runtime(shown_per_tick: int, decoded_per_tick: int):
+    """A wall whose tile receives `shown` of the `decoded` frames each tick."""
+    runtime, viewport = _tile_runtime(last_output_at=None)
+    feed = runtime.feeds["cam"]
+    step = {"n": 0}
+
+    def tick(now: float) -> bool:
+        step["n"] += 1
+        viewport.output_total = shown_per_tick * step["n"]
+        feed.decoded_total = decoded_per_tick * step["n"]
+        return runtime._tile_falling_behind(viewport, feed, now)
+
+    return runtime, viewport, tick
+
+
+def test_a_tile_keeping_up_is_not_repaired() -> None:
+    # Healthy is parity: every static viewport on the wall reports the queued
+    # and decoded rates equal to the first decimal.
+    _runtime, _vp, tick = _rate_runtime(shown_per_tick=30, decoded_per_tick=30)
+    assert [tick(t) for t in (0.0, 5.0, 40.0, 80.0)] == [False] * 4
+
+
+def test_a_tile_showing_a_trickle_is_repaired() -> None:
+    # The production fault: a tile rendering about one frame every three
+    # seconds from a feed decoding thirty, for two hours, while the stall
+    # watchdog and the quiet test both reported healthy.
+    _runtime, viewport, tick = _rate_runtime(shown_per_tick=1, decoded_per_tick=30)
+    assert tick(0.0) is False
+    assert tick(5.0) is False
+    assert tick(5.0 + WallRuntime.TILE_SLOW_SECONDS) is True
+    assert viewport.rate_shown == 1
+    assert viewport.rate_decoded == 30
+
+
+def test_a_brief_dip_is_not_enough() -> None:
+    # A rotation, a backoff or a reconnect can starve a tile for a moment.
+    _runtime, _vp, tick = _rate_runtime(shown_per_tick=1, decoded_per_tick=30)
+    tick(0.0)
+    assert tick(5.0) is False
+    assert tick(5.0 + WallRuntime.TILE_SLOW_SECONDS / 2) is False
+
+
+def test_a_tile_recovering_before_the_dwell_starts_over() -> None:
+    runtime, viewport, _tick = _rate_runtime(1, 30)
+    feed = runtime.feeds["cam"]
+    runtime._tile_falling_behind(viewport, feed, 0.0)
+    viewport.output_total, feed.decoded_total = 1, 30
+    assert runtime._tile_falling_behind(viewport, feed, 5.0) is False
+    # Parity returns, so the clock restarts and the later tick cannot fire.
+    viewport.output_total, feed.decoded_total = 31, 60
+    assert runtime._tile_falling_behind(viewport, feed, 10.0) is False
+    viewport.output_total, feed.decoded_total = 32, 90
+    assert runtime._tile_falling_behind(
+        viewport, feed, 10.0 + WallRuntime.TILE_SLOW_SECONDS / 2
+    ) is False
+
+
+def test_a_feed_decoding_nothing_never_matures_into_a_rebuild() -> None:
+    # A camera that is merely off must not have its branch rebuilt: with
+    # nothing decoded the comparison reads 0 >= 0, resetting the dwell on
+    # every tick however long the outage lasts.
+    runtime, viewport, _tick = _rate_runtime(0, 0)
+    feed = runtime.feeds["cam"]
+    viewport.output_total, feed.decoded_total = 1, 30
+    runtime._tile_falling_behind(viewport, feed, 0.0)
+    for t in (5.0, 10.0, 10.0 + WallRuntime.TILE_SLOW_SECONDS * 3):
+        viewport.output_total, feed.decoded_total = 1, 30
+        assert runtime._tile_falling_behind(viewport, feed, t) is False
+
 
 
 def test_a_tile_that_goes_quiet_under_a_healthy_feed_is_repaired(monkeypatch) -> None:
