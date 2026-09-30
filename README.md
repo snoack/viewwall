@@ -1,5 +1,28 @@
 # Viewwall
 
+> [!WARNING]
+> **Viewwall is deprecated** in favor of
+> [viewpie](https://github.com/snoack/viewpie), which supersedes it and is
+> where development continues. Please use Viewpie for new installations.
+>
+> Viewwall hit two limits of its Python and GStreamer foundation:
+>
+> - **No atomic presenter.** Viewwall has two output backends, and each gives
+>   up something. `kms-planes` scans every viewport out on its own plane
+>   through its own `kmssink`, but the independent page flips share one
+>   refresh, capping each viewport at roughly the refresh rate divided by the
+>   number of viewports. `compositor` renders the wall in software, which
+>   gives up most of the benefit of hardware acceleration and costs a lot of
+>   CPU. The right design lies between the two: an atomic presenter that still
+>   scans each feed out on its own KMS plane, but commits all of them together
+>   once per refresh. That cannot be built in Python on top of GStreamer.
+> - **No hardware H.265 decoding on the Raspberry Pi.** Current GStreamer
+>   does not support the Pi's HEVC decoder, so H.265 cameras fall back to
+>   software decoding.
+>
+> Viewpie is written in Rust around one atomic commit for the whole wall,
+> and decodes with FFmpeg's libav* libraries.
+
 Show all your security cameras on one screen, on a Raspberry Pi.
 
 Viewwall turns a Pi and a TV into a camera wall: a grid of live RTSP feeds,
