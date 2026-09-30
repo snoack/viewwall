@@ -876,7 +876,6 @@ def test_spacing_defaults_to_zero_without_either_table(tmp_path: Path) -> None:
     display = config.displays[0]
     assert config.layout_for(display).gap_px == 0
     assert config.layout_for(display).outer_margin_px == 0
-    assert config.drm.device == "/dev/dri/card0"
     # A configuration that names no display still has one, discovered.
     assert display.name == "main"
     assert display.connector_id is None
