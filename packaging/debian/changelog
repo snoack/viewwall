@@ -1,3 +1,33 @@
+viewwall (0.1.5-1) unstable; urgency=medium
+
+  * Viewwall is deprecated in favor of viewpie
+    (https://github.com/snoack/viewpie), and this is its last release.
+    Presenting every viewport in one atomic KMS commit cannot be built in
+    Python on top of GStreamer, and current GStreamer has no hardware H.265
+    decoding on the Raspberry Pi.
+  * Add a compositor output backend, selected with
+    drm.output_backend = "compositor". It blends every viewport into one
+    frame on a single sink, so the whole wall goes out in one commit and each
+    tile runs at its own feed's rate instead of sharing the refresh rate with
+    the others. The cost is a CPU blend of the whole frame. kms-planes stays
+    the default and is still the zero-copy path.
+  * Let a display name its refresh rate, as in mode = "1920x1080@60".
+    Previously the driver chose, which on a panel offering 120Hz meant 120Hz.
+  * Run on a Raspberry Pi 5. The DRM card is picked by its connectors rather
+    than assumed to be card0, since a Pi 5's card0 is the render-only v3d.
+  * Build the container image from the Debian package, so the dependencies
+    are named in one place. The image previously shipped no H.264 decoder,
+    which a Pi 3 hid and which made every feed fail on a Pi 5.
+  * Refuse a camera's audio stream in RTSP setup rather than receiving it and
+    discarding it, saving two elements per feed.
+  * Rebuild the branch behind a viewport that shows only a trickle of the
+    frames its feed decodes, including on a rotating viewport. A tile passing
+    one frame in ninety previously looked healthy to every check.
+  * Log how many buffers a rotating viewport's output queue held at a switch,
+    beside the time figure, which cannot tell a full queue from an empty one.
+
+ -- Sebastian Noack <sebastian.noack@gmail.com>  Wed, 30 Sep 2026 02:00:00 -0400
+
 viewwall (0.1.4-1) unstable; urgency=medium
 
   * Decide a feed's repair from why it failed rather than from RTP packet
